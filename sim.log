@@ -1,0 +1,2 @@
+line_sim: A=127.0.0.1:6001 B=127.0.0.1:6002 rate=8000 Hz, relaying 40-sample blocks
+line_sim: closing (A->B slip range [0,0], B->A [0,0])

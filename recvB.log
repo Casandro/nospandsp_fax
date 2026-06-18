@@ -1,0 +1,27 @@
+listening on port 6002 ...
+  <fax> A set_tx_type type=2 rate=0 short=0 hdlc=0
+  <fax> A set_tx_type type=4 rate=300 short=0 hdlc=1
+  <fax> A set_rx_type type=4 rate=300 short=0 hdlc=1
+  <fax> A v21 rx status=-2
+  <fax> A set_rx_type type=7 rate=14400 short=0 hdlc=0
+  <qam> t=0.00s carrier UP (power=309970 on=5210)
+  <fax> A v21 rx status=-1
+  <qam> t=0.06s carrier DOWN (power=1547 off=1647)
+  <qam> t=0.32s carrier UP (power=8399 on=5210)
+  <fax> A v21 rx status=-2
+  <qam> t=3.26s carrier DOWN (power=1351 off=1647)
+  <fax> A set_tx_type type=4 rate=300 short=0 hdlc=1
+  <fax> A set_rx_type type=7 rate=14400 short=1 hdlc=1
+  <qam> t=4.47s carrier UP (power=8336 on=5210)
+  <qam> t=5.54s carrier DOWN (power=681 off=1647)
+  <fax> A set_rx_type type=4 rate=300 short=0 hdlc=1
+  <fax> A v21 rx status=-2
+  <fax> A set_tx_type type=4 rate=300 short=0 hdlc=1
+  <fax> A v21 rx status=-1
+  <fax> A set_rx_type type=4 rate=300 short=0 hdlc=1
+  <fax> A v21 rx status=-2
+  <fax> A set_tx_type type=0 rate=0 short=0 hdlc=0
+  <fax> A set_rx_type type=0 rate=0 short=0 hdlc=0
+  <fax> A set_tx_type type=8 rate=0 short=0 hdlc=0
+Phase E: OK
+  pages tx=0 rx=1, 1728x300, 14400 bps
