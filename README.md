@@ -329,35 +329,22 @@ colour to a colour-capable caller and falls back to greyscale/bilevel
 otherwise — exactly like a normal `pdffax.sh` send. Both transports work
 (`--sip-answer`/`--sip-dial` or `--listen`/`--connect`).
 
-### Per-mode source images (`pollfax.sh`)
+### Per-mode source images (`fax_test.sh`)
 
-`pollfax.sh` sends — or serves for polling — a *different source image per
+`fax_test.sh` sends — or serves for polling — a *different source image per
 negotiated mode*, rather than one document rendered every way. The direction
 follows the transport: `--sip-dial`/`--connect` places the call and transmits
 now; `--sip-answer`/`--listen` waits to be polled. Either way the best version
 the far end supports is chosen at phase B. It scales each image up to the
 required fax width and Floyd-Steinberg dithers the bilevel ones:
 
-| far end can receive | source image       | rendition                         |
-|---------------------|--------------------|-----------------------------------|
-| full colour         | `farbe.png`        | T.42 colour JPEG, 200 dpi         |
-| greyscale JPEG      | `graustufen_2.png` | T.81 greyscale JPEG, 200 dpi      |
-| bilevel 300 dpi     | `300dpi_2.png`     | Group-4, 2592 wide                |
-| bilevel 204 dpi     | `default.png`      | Group-4, 1728 wide (std/fine/sfine) |
 
 ```sh
-pollfax.sh --sip-dial fax --user sip:fax@192.0.2.10        # send now
-pollfax.sh --sip-answer --register --user sip:fax@192.0.2.10  # serve a poll
-pollfax.sh --connect 127.0.0.1:5000                        # send (TCP test)
-pollfax.sh --listen 5000                                   # serve a poll (TCP test)
+fax_test.sh --sip-dial fax --user sip:fax@192.0.2.10        # send now
+fax_test.sh --sip-answer --register --user sip:fax@192.0.2.10  # serve a poll
+fax_test.sh --connect 127.0.0.1:5000                        # send (TCP test)
+fax_test.sh --listen 5000                                   # serve a poll (TCP test)
 ```
-
-The six pages come pre-rendered in `poll_pages/` and are served without
-run-time rendering; set `POLLFAX_RENDER=1` to re-render from the source images,
-or `POLLFAX_PAGES=<dir>` to serve a different rendered set. When rendering, the
-source images are read from `$POLLFAX_IMGDIR` (default `./original_images`, then
-`<script>/../original_images`); each filename is overridable
-(`POLLFAX_DEFAULT`, `POLLFAX_300`, `POLLFAX_GRAY`, `POLLFAX_COLOR`).
 
 ## Multi-page documents (PDF → TIFF)
 
