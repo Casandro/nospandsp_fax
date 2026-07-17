@@ -164,19 +164,30 @@ int nf_udptl_rx(nf_udptl_t *s, const uint8_t *buf, int len,
         s->rx_seq_no = seq;
     }
 
-    if (seq < s->rx_seq_no)             /* old / duplicate primary */
+    /* The wire sequence number is 16 bits and wraps; compare in that space.
+     * `fwd` is how far seq is ahead of what we expect, modulo 65536. A value
+     * in the backward half-window is an old/duplicate primary and is dropped
+     * WITHOUT advancing rx_seq_no - otherwise one spoofed datagram (e.g.
+     * seq=0xFFFF) would push rx_seq_no past every legitimate packet and stall
+     * the receiver permanently. This also handles the natural 16-bit wrap. */
+    int fwd = (seq - s->rx_seq_no) & 0xFFFF;
+    if (fwd >= 0x8000)                  /* old / duplicate / implausible jump */
         return 0;
 
-    /* Fill any gap [rx_seq_no, seq) from the secondaries (oldest first). The
-     * m-th secondary carries sequence seq-(m+1), so packet g is secs[seq-g-1]. */
-    for (int g = s->rx_seq_no; g < seq; g++) {
-        int idx = seq - g - 1;
-        if (idx >= 0 && idx < total && seclen[idx] > 0)
+    /* Fill any gap from the secondaries (oldest first). The m-th secondary
+     * carries sequence seq-(m+1); only `total` are present, so cap the fill at
+     * the redundancy depth — which also bounds this loop to NF_UDPTL_BUF. */
+    int gap = fwd;
+    if (gap > total) gap = total;
+    for (int m = gap; m >= 1; m--) {
+        int idx = m - 1;                /* secs[0]=seq-1, secs[1]=seq-2, ...   */
+        int g = (seq - m) & 0xFFFF;
+        if (idx < total && seclen[idx] > 0)
             fn(user, secs[idx], seclen[idx], g);
         /* else: lost beyond redundancy depth — leave the gap (T.38 copes). */
     }
 
     fn(user, primary, plen, seq);
-    s->rx_seq_no = seq + 1;
+    s->rx_seq_no = (seq + 1) & 0xFFFF;
     return 0;
 }

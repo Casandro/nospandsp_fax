@@ -53,3 +53,18 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# ── this project ──────────────────────────────────────────────────────────
+# Built binaries (extensionless, so not caught by the patterns above)
+/sip_fax
+/line_sim
+/tests/nf_*
+!/tests/*.c
+!/tests/*.h
+
+# Transient test artifacts (all underscore-prefixed) and stray run logs
+/_*
+/*.log
+
+# Local reference material (ITU specs, line captures) - kept locally, not shipped
+/references/

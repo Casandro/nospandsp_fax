@@ -9,6 +9,7 @@
 #include <strings.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <time.h>
 #include <errno.h>
 #include <sys/select.h>
@@ -28,13 +29,45 @@
 
 #define PCMA_PT      8         /* RTP payload type for G.711 A-law          */
 #define RTP_TS_INCR  160       /* 20 ms at 8 kHz                            */
-#define SIP_TIMEOUT  32000     /* overall give-up for a transaction (ms)    */
+#define SIP_TIMEOUT  32000     /* Timer B: give up an INVITE with no response yet */
+#define SIP_TIMER_C  180000    /* Timer C: give up an INVITE that is ringing (>3 min) */
 
 /* ── Low-level send/recv ──────────────────────────────────────────────── */
 
 static void sip_send(int sock, const char *buf, int len, struct sockaddr_in *to)
 {
     sendto(sock, buf, (size_t)len, 0, (struct sockaddr *)to, sizeof(*to));
+}
+
+/* Fill a Via branch token: the RFC 3261 magic cookie + 12 random hex digits.
+ * `branch` must hold at least 20 bytes (7 + 12 + NUL). */
+static void gen_branch(char *branch)
+{
+    memcpy(branch, "z9hG4bK", 7);
+    gen_hex(branch + 7, 12);
+}
+
+static void vlog(const sip_media_t *m, const char *dir, const char *msg);
+
+/* Format a SIP message into a local buffer and send it to `to`, clamping the
+ * (untruncated) snprintf length so a would-be-oversized message never makes
+ * sendto read past the buffer, then log it. For the bodyless responses and
+ * dialog requests we build ad hoc; the retransmit-cached 200 OK/ACK and the
+ * two deliberately-unlogged sends (provisional 100/180, T.38 ACK) keep their
+ * own inline builders. */
+static void sip_sendf(sip_media_t *m, struct sockaddr_in *to, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+static void sip_sendf(sip_media_t *m, struct sockaddr_in *to, const char *fmt, ...)
+{
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n >= (int) sizeof buf) n = (int) sizeof buf - 1;
+    sip_send(m->sip_sock, buf, n, to);
+    vlog(m, "TX", buf);
 }
 
 /* Wait up to timeout_ms for one SIP datagram. Returns its length (NUL
@@ -57,19 +90,53 @@ static int sip_recv(int sock, char *buf, int cap, int timeout_ms,
     return (int)n;
 }
 
+/* Optional wall-clock prefix ("HH:MM:SS.mmm ") on every protocol log line, so
+ * SIP and T.30 events can be correlated in time. Enabled by NF_LOG_TS (set by
+ * sip_fax --debug). Cached so the common (no-timestamp) path stays cheap. */
+static void nf_log_ts(FILE *f)
+{
+    static int en = -1;
+    if (en < 0) en = getenv("NF_LOG_TS") != NULL;
+    if (!en) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm);
+    fprintf(f, "%02d:%02d:%02d.%03ld ",
+            tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000);
+}
+
 static void vlog(const sip_media_t *m, const char *dir, const char *msg)
 {
     if (!m->verbose) return;
+    /* Full-message dump (all headers) vs. just the request/status line.
+     * Enabled by NF_SIP_FULL (set by sip_fax --debug). */
+    static int full = -1;
+    if (full < 0) full = getenv("NF_SIP_FULL") != NULL;
+
+    nf_log_ts(stderr);
+    if (m->log_callid && m->call_id[0])
+        fprintf(stderr, "[%s] ", m->call_id);
+
+    if (full) {
+        fprintf(stderr, "SIP %s (%zu bytes):\n", dir, strlen(msg));
+        for (const char *p = msg; *p; ) {
+            const char *nl = strpbrk(p, "\r\n");
+            int len = nl ? (int)(nl - p) : (int)strlen(p);
+            if (len > 0) fprintf(stderr, "    | %.*s\n", len, p);
+            if (!nl) break;
+            p = nl + ((nl[0] == '\r' && nl[1] == '\n') ? 2 : 1);
+        }
+        return;
+    }
+
     char first[120];
     int i = 0;
     while (msg[i] && msg[i] != '\r' && msg[i] != '\n' && i < (int)sizeof(first) - 1) {
         first[i] = msg[i]; i++;
     }
     first[i] = '\0';
-    if (m->log_callid && m->call_id[0])
-        fprintf(stderr, "[%s] SIP %s %s\n", m->call_id, dir, first);
-    else
-        fprintf(stderr, "SIP %s %s\n", dir, first);
+    fprintf(stderr, "SIP %s %s\n", dir, first);
 }
 
 /* ── Local IP / address resolution ───────────────────────────────────── */
@@ -136,10 +203,22 @@ static int rtp_open(sip_media_t *m, int *port)
     socklen_t sl = sizeof(a);
     getsockname(m->rtp_sock, (struct sockaddr *)&a, &sl);
     *port = ntohs(a.sin_port);
-    m->rtp_ssrc = rng_seed() * 1664525u + 1013904223u;
-    m->rtp_seq  = (uint16_t)rng_seed();
-    m->rtp_ts   = rng_seed();
+    m->rtp_ssrc = rng_u32();
+    m->rtp_seq  = (uint16_t) rng_u32();
+    m->rtp_ts   = rng_u32();
     return 0;
+}
+
+/* Symmetric-RTP/UDPTL latch guard: accept a media source only if it plausibly
+ * is our peer - same IP as the SDP-negotiated media address (`neg`) or as the
+ * signalling peer. This still follows a NAT-mapped PORT change (the reason
+ * symmetric RTP exists) but refuses to hand our media stream to an unrelated
+ * host. Callers latch to the first plausible source and then lock it. */
+static int media_src_plausible(const sip_media_t *m, const struct sockaddr_in *src,
+                               const struct sockaddr_in *neg)
+{
+    return src->sin_addr.s_addr == neg->sin_addr.s_addr ||
+           src->sin_addr.s_addr == m->sip_peer.sin_addr.s_addr;
 }
 
 void sip_media_tx(sip_media_t *m, const int16_t *pcm, int n)
@@ -171,10 +250,18 @@ int sip_media_rx(sip_media_t *m, int16_t *pcm, int max)
                          (struct sockaddr *)&src, &sl);
     if (r <= 12) return 0;
 
-    /* Symmetric RTP: follow the peer's actual source (NAT-mapped) address. */
-    if (src.sin_addr.s_addr != m->remote_rtp.sin_addr.s_addr ||
-        src.sin_port        != m->remote_rtp.sin_port)
-        m->remote_rtp = src;
+    /* Symmetric RTP: adopt the peer's actual (NAT-mapped) source ONCE from a
+     * plausible address, then lock it; ignore media from any other source.
+     * Without this a single unsolicited packet redirected our TX stream. */
+    if (!m->rtp_latched) {
+        if (!media_src_plausible(m, &src, &m->remote_rtp))
+            return 0;                       /* unrelated host: drop */
+        m->remote_rtp  = src;
+        m->rtp_latched = 1;
+    } else if (src.sin_addr.s_addr != m->remote_rtp.sin_addr.s_addr ||
+               src.sin_port        != m->remote_rtp.sin_port) {
+        return 0;                           /* not our latched peer: drop */
+    }
 
     if ((pkt[1] & 0x7F) != PCMA_PT) return 0;
     int hdr = 12 + (pkt[0] & 0x0F) * 4;
@@ -214,13 +301,16 @@ static int parse_sdp(const char *body, char *remote_ip, int *port)
 
     const char *p = body;
     while (*p) {
+        const char *eol = p;
+        while (*eol && *eol != '\r' && *eol != '\n') eol++;
         if (p[0] == 'c' && p[1] == '=') {
+            /* Search for the address only within this c= line, not the rest of
+             * the body: a malformed c= must not borrow an IP4 from a later line. */
             const char *ip = strstr(p, "IP4 ");
-            if (ip) {
+            if (ip && ip < eol) {
                 ip += 4;
-                const char *e = ip;
-                while (*e && *e != '\r' && *e != '\n') e++;
-                int n = (int)(e - ip);
+                int n = (int)(eol - ip);
+                if (n < 0) n = 0;
                 if (n > 63) n = 63;
                 memcpy(remote_ip, ip, (size_t)n);
                 remote_ip[n] = '\0';
@@ -255,6 +345,7 @@ static void set_remote_rtp(sip_media_t *m, const char *remote_ip, int port)
     m->remote_rtp.sin_port   = htons((uint16_t)port);
     inet_pton(AF_INET, remote_ip, &m->remote_rtp.sin_addr);
     m->have_rtp_dest = 1;
+    m->rtp_latched   = 0;   /* re-latch to the newly negotiated address */
 }
 
 /* ── T.38 / UDPTL media ─────────────────────────────────────────────────── */
@@ -293,21 +384,25 @@ static int parse_t38_sdp(const char *body, char *remote_ip, int *port, int *far_
 
     const char *p = body;
     while (*p) {
+        const char *eol = p;
+        while (*eol && *eol != '\r' && *eol != '\n') eol++;
         if (p[0] == 'c' && p[1] == '=') {
+            /* Search within this c= line only (see parse_sdp). */
             const char *ip = strstr(p, "IP4 ");
-            if (ip) {
+            if (ip && ip < eol) {
                 ip += 4;
-                const char *e = ip;
-                while (*e && *e != '\r' && *e != '\n') e++;
-                int n = (int) (e - ip);
+                int n = (int) (eol - ip);
+                if (n < 0) n = 0;
                 if (n > 63) n = 63;
                 memcpy(remote_ip, ip, (size_t) n);
                 remote_ip[n] = '\0';
             }
-        } else if (p[0] == 'm' && p[1] == '=' && strncmp(p, "m=image", 7) == 0
-                   && strstr(p, "udptl") && strstr(p, "t38")) {
+        } else if (p[0] == 'm' && p[1] == '=' && strncmp(p, "m=image", 7) == 0) {
+            /* Require udptl+t38 on THIS m= line, not anywhere in the body. */
+            const char *u = strstr(p, "udptl"), *t = strstr(p, "t38");
             int pv;
-            if (sscanf(p + 2, "image %d", &pv) == 1 && pv > 0) { *port = pv; found = 1; }
+            if (u && u < eol && t && t < eol &&
+                sscanf(p + 2, "image %d", &pv) == 1 && pv > 0) { *port = pv; found = 1; }
         } else if (p[0] == 'a' && p[1] == '=' &&
                    strncmp(p, "a=T38FaxMaxDatagram:", 20) == 0) {
             int dg = atoi(p + 20);
@@ -344,6 +439,7 @@ static void set_t38_peer(sip_media_t *m, const char *ip, int port)
     m->t38_peer.sin_family = AF_INET;
     m->t38_peer.sin_port = htons((uint16_t) port);
     inet_pton(AF_INET, ip, &m->t38_peer.sin_addr);
+    m->t38_latched = 0;   /* re-latch to the newly negotiated address */
 }
 
 int sip_media_is_t38(const sip_media_t *m) { return m->t38_active; }
@@ -363,10 +459,31 @@ int sip_t38_rx(sip_media_t *m, uint8_t *buf, int max)
     ssize_t r = recvfrom(m->t38_sock, buf, (size_t) max, MSG_DONTWAIT,
                          (struct sockaddr *) &src, &sl);
     if (r <= 0) return 0;
-    /* Symmetric: follow the peer's actual source (NAT). */
-    if (src.sin_addr.s_addr != m->t38_peer.sin_addr.s_addr ||
-        src.sin_port != m->t38_peer.sin_port)
-        m->t38_peer = src;
+    int dbg = getenv("NF_T38_DBG") != NULL;
+    /* Symmetric UDPTL: adopt the peer's actual source ONCE from a plausible
+     * address, then lock it; ignore datagrams from any other source. */
+    if (!m->t38_latched) {
+        if (!media_src_plausible(m, &src, &m->t38_peer)) {
+            if (dbg) fprintf(stderr, "[T38 sock] drop %zd bytes from %s:%d "
+                             "(implausible; expected %s:%d)\n", r,
+                             inet_ntoa(src.sin_addr), ntohs(src.sin_port),
+                             inet_ntoa(m->t38_peer.sin_addr), ntohs(m->t38_peer.sin_port));
+            return 0;                       /* unrelated host: drop */
+        }
+        m->t38_peer    = src;
+        m->t38_latched = 1;
+        if (dbg) fprintf(stderr, "[T38 sock] latched to %s:%d\n",
+                         inet_ntoa(src.sin_addr), ntohs(src.sin_port));
+    } else if (src.sin_addr.s_addr != m->t38_peer.sin_addr.s_addr ||
+               src.sin_port != m->t38_peer.sin_port) {
+        if (dbg) fprintf(stderr, "[T38 sock] drop %zd bytes from %s:%d "
+                         "(not latched peer %s:%d)\n", r,
+                         inet_ntoa(src.sin_addr), ntohs(src.sin_port),
+                         inet_ntoa(m->t38_peer.sin_addr), ntohs(m->t38_peer.sin_port));
+        return 0;                           /* not our latched peer: drop */
+    }
+    if (dbg) fprintf(stderr, "[T38 sock] rx %zd bytes from %s:%d\n", r,
+                     inet_ntoa(src.sin_addr), ntohs(src.sin_port));
     return (int) r;
 }
 
@@ -394,33 +511,77 @@ static void extract_uri(const char *hdr, char *out, int cap)
 
 /* ── Digest auth ──────────────────────────────────────────────────────── */
 
-/* Build a Digest Authorization/Proxy-Authorization header into out. */
+/* Does the challenge's qop-options list contain the "auth" token (as opposed
+ * to only "auth-int", which we can't do without hashing the body)? */
+static int qop_has_auth(const char *qop)
+{
+    if (!qop) return 0;
+    for (const char *p = qop; *p; ) {
+        while (*p == ' ' || *p == ',') p++;
+        const char *s = p;
+        while (*p && *p != ',') p++;
+        int len = (int)(p - s);
+        while (len > 0 && s[len - 1] == ' ') len--;
+        if (len == 4 && strncmp(s, "auth", 4) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Build a Digest Authorization/Proxy-Authorization header into out. Uses
+ * qop=auth (with a fresh cnonce and nc) when the challenge offers it - which
+ * makes the response non-replayable and interoperable with modern servers -
+ * and falls back to the RFC 2069 form otherwise. Buffers are sized so a
+ * maximum-length realm/nonce/uri is hashed in full rather than silently
+ * truncated (which would compute the digest over the wrong input). */
 static void build_auth(const char *user, const char *pass, const char *method,
                        const char *uri, const char *realm, const char *nonce,
+                       const char *qop, const char *opaque,
                        int proxy, char *out, int cap)
 {
-    char ha1_in[512], ha2_in[320], resp_in[160], ha1[33], ha2[33], resp[33];
+    char ha1_in[640], ha2_in[768], resp_in[512], ha1[33], ha2[33], resp[33];
     snprintf(ha1_in, sizeof(ha1_in), "%s:%s:%s", user, realm, pass);
     snprintf(ha2_in, sizeof(ha2_in), "%s:%s", method, uri);
     md5_hex(ha1_in, ha1);
     md5_hex(ha2_in, ha2);
-    snprintf(resp_in, sizeof(resp_in), "%s:%s:%s", ha1, nonce, ha2);
-    md5_hex(resp_in, resp);
-    snprintf(out, (size_t)cap,
-        "%s: Digest username=\"%s\",realm=\"%s\",nonce=\"%s\","
-        "uri=\"%s\",response=\"%s\",algorithm=MD5\r\n",
-        proxy ? "Proxy-Authorization" : "Authorization",
-        user, realm, nonce, uri, resp);
+
+    char opq[192] = "";
+    if (opaque && opaque[0]) snprintf(opq, sizeof(opq), ",opaque=\"%s\"", opaque);
+
+    if (qop_has_auth(qop)) {
+        char cnonce[17];
+        gen_hex(cnonce, 16);
+        const char *nc = "00000001";     /* one use per fresh cnonce */
+        snprintf(resp_in, sizeof(resp_in), "%s:%s:%s:%s:auth:%s",
+                 ha1, nonce, nc, cnonce, ha2);
+        md5_hex(resp_in, resp);
+        snprintf(out, (size_t)cap,
+            "%s: Digest username=\"%s\",realm=\"%s\",nonce=\"%s\",uri=\"%s\","
+            "response=\"%s\",algorithm=MD5,qop=auth,nc=%s,cnonce=\"%s\"%s\r\n",
+            proxy ? "Proxy-Authorization" : "Authorization",
+            user, realm, nonce, uri, resp, nc, cnonce, opq);
+    } else {
+        snprintf(resp_in, sizeof(resp_in), "%s:%s:%s", ha1, nonce, ha2);
+        md5_hex(resp_in, resp);
+        snprintf(out, (size_t)cap,
+            "%s: Digest username=\"%s\",realm=\"%s\",nonce=\"%s\","
+            "uri=\"%s\",response=\"%s\",algorithm=MD5%s\r\n",
+            proxy ? "Proxy-Authorization" : "Authorization",
+            user, realm, nonce, uri, resp, opq);
+    }
 }
 
-/* Pull realm/nonce out of a 401/407 into the given buffers. */
-static void challenge(const char *msg, char *realm, char *nonce)
+/* Pull realm/nonce (and qop/opaque, if present) out of a 401/407. Buffers are
+ * the fixed sizes the callers declare: realm/nonce[256], qop[64], opaque[192]. */
+static void challenge(const char *msg, char *realm, char *nonce,
+                      char *qop, char *opaque)
 {
     char hdr[600] = "";
     if (!sip_hdr(msg, "WWW-Authenticate", hdr, sizeof(hdr)))
         sip_hdr(msg, "Proxy-Authenticate", hdr, sizeof(hdr));
     parse_quoted(hdr, "realm", realm, 256);
     parse_quoted(hdr, "nonce", nonce, 256);
+    parse_quoted(hdr, "qop", qop, 64);
+    parse_quoted(hdr, "opaque", opaque, 192);
 }
 
 /* ── REGISTER (answer mode, optional) ─────────────────────────────────── */
@@ -431,21 +592,21 @@ static int do_register(sip_media_t *m, const sip_config_t *cfg,
     char call_id[40], tok[20];
     gen_hex(tok, 16);
     snprintf(call_id, sizeof(call_id), "reg-%s", tok);
-    char realm[256] = "", nonce[256] = "";
+    char realm[256] = "", nonce[256] = "", qop[64] = "", opaque[192] = "";
     int cseq = 1;
 
     for (int attempt = 0; attempt < 2; attempt++) {
-        char branch[20] = "z9hG4bK", from_tag[16];
-        gen_hex(branch + 7, 10);
+        char branch[20], from_tag[16];
+        gen_branch(branch);
         gen_hex(from_tag, 10);
 
         char uri[300];
         snprintf(uri, sizeof(uri), "sip:%s", cfg->registrar_host);
 
-        char auth[600] = "";
+        char auth[800] = "";
         if (attempt == 1)
             build_auth(cfg->local_user, cfg->password, "REGISTER", uri,
-                       realm, nonce, 0, auth, sizeof(auth));
+                       realm, nonce, qop, opaque, 0, auth, sizeof(auth));
 
         char req[2048];
         int n = snprintf(req, sizeof(req),
@@ -483,7 +644,7 @@ static int do_register(sip_media_t *m, const sip_config_t *cfg,
             return 0;
         }
         if ((code == 401 || code == 407) && attempt == 0 && cfg->password[0]) {
-            challenge(resp, realm, nonce);
+            challenge(resp, realm, nonce, qop, opaque);
             continue;
         }
         fprintf(stderr, "REGISTER failed (%d)\n", code);
@@ -497,13 +658,14 @@ static int do_register(sip_media_t *m, const sip_config_t *cfg,
 static int build_invite(sip_media_t *m, const sip_config_t *cfg,
                         const char *target_uri, const char *from_tag,
                         const char *branch, int cseq, int rtp_port,
-                        const char *realm, const char *nonce, int proxy,
+                        const char *realm, const char *nonce,
+                        const char *qop, const char *opaque, int proxy,
                         char *req, int cap)
 {
-    char auth[700] = "";
+    char auth[900] = "";
     if (realm && realm[0] && nonce && nonce[0] && cfg->password[0])
         build_auth(cfg->local_user, cfg->password, "INVITE", target_uri,
-                   realm, nonce, proxy, auth, sizeof(auth));
+                   realm, nonce, qop, opaque, proxy, auth, sizeof(auth));
 
     char sdp[512];
     int sdp_len = build_sdp(m->local_ip, rtp_port, sdp, sizeof(sdp));
@@ -537,7 +699,7 @@ static void send_ack(sip_media_t *m, const sip_config_t *cfg,
                      const char *fixed_branch)
 {
     char branch[20];
-    if (new_branch) { strcpy(branch, "z9hG4bK"); gen_hex(branch + 7, 12); }
+    if (new_branch) gen_branch(branch);
     else { strncpy(branch, fixed_branch, sizeof(branch) - 1); branch[sizeof(branch)-1] = '\0'; }
 
     int n = snprintf(m->ok_buf, sizeof(m->ok_buf),
@@ -556,6 +718,73 @@ static void send_ack(sip_media_t *m, const sip_config_t *cfg,
     if (n >= (int)sizeof(m->ok_buf)) n = (int)sizeof(m->ok_buf) - 1;
     m->ok_buf_len = n;            /* kept so a retransmitted 2xx can be re-ACKed */
     sip_send(m->sip_sock, m->ok_buf, n, &m->sip_peer);
+}
+
+/* Cancel an INVITE that is in progress (a provisional was received but no final
+ * response arrived in time). RFC 3261 §9.1: the CANCEL reuses the INVITE's
+ * top Via branch, Call-ID, From (with tag), To (no tag) and CSeq number, with
+ * method CANCEL. The peer answers 200 (to the CANCEL) then 487 (to the INVITE),
+ * which the caller ACKs. */
+static void send_cancel(sip_media_t *m, const sip_config_t *cfg,
+                        const char *target_uri, const char *from_tag,
+                        const char *branch, int cseq)
+{
+    char req[1024];
+    int n = snprintf(req, sizeof req,
+        "CANCEL %s SIP/2.0\r\n"
+        "Via: SIP/2.0/UDP %s:%d;branch=%s;rport\r\n"
+        "Max-Forwards: 70\r\n"
+        "From: <sip:%s@%s>;tag=%s\r\n"
+        "To: <%s>\r\n"
+        "Call-ID: %s\r\n"
+        "CSeq: %d CANCEL\r\n"
+        "Content-Length: 0\r\n\r\n",
+        target_uri, m->local_ip, m->local_sip_port, branch,
+        cfg->local_user, cfg->registrar_host, from_tag, target_uri,
+        m->call_id, cseq);
+    if (n >= (int) sizeof req) n = (int) sizeof req - 1;
+    sip_send(m->sip_sock, req, n, &m->sip_peer);
+    vlog(m, "TX", req);
+}
+
+/* After sending a CANCEL, drain responses briefly: ACK the 487 (final response
+ * to the cancelled INVITE); ignore the 200 to the CANCEL itself. If the callee
+ * raced us and answered (2xx to the INVITE), ACK it and BYE so we don't leave a
+ * dangling dialog. */
+static void await_cancel_final(sip_media_t *m, const sip_config_t *cfg,
+                               const char *target_uri, const char *from_tag,
+                               const char *branch, int cseq)
+{
+    struct timespec dl;
+    clock_gettime(CLOCK_MONOTONIC, &dl);
+    ts_add_ms(&dl, 5000);
+    for (;;) {
+        long w = ts_until_ms(&dl);
+        if (w <= 0) break;
+        char resp[8192]; struct sockaddr_in from;
+        int r = sip_recv(m->sip_sock, resp, sizeof resp, (int) w, &from);
+        if (r <= 0) break;
+        vlog(m, "RX", resp);
+        int code = sip_response_code(resp);
+        if (code == 0) continue;
+        char csq[64] = ""; sip_hdr(resp, "CSeq", csq, sizeof csq);
+        if (strstr(csq, "CANCEL")) continue;      /* 200 to our CANCEL: keep waiting */
+        if (code < 200) continue;                 /* stray provisional */
+        char to_hdr[300] = ""; sip_hdr(resp, "To", to_hdr, sizeof to_hdr);
+        if (code >= 300) {                        /* 487 (or other) final to INVITE */
+            send_ack(m, cfg, target_uri, from_tag, to_hdr, cseq, 0, branch);
+            return;
+        }
+        /* raced 2xx: the call actually came up despite the CANCEL - ACK + BYE */
+        send_ack(m, cfg, target_uri, from_tag, to_hdr, cseq, 1, branch);
+        snprintf(m->bye_ruri, sizeof m->bye_ruri, "%s", target_uri);
+        snprintf(m->bye_from, sizeof m->bye_from,
+                 "<sip:%s@%s>;tag=%s", cfg->local_user, cfg->registrar_host, from_tag);
+        snprintf(m->bye_to, sizeof m->bye_to, "%s", to_hdr);
+        m->cseq = cseq + 1;
+        sip_call_send_bye(m);
+        return;
+    }
 }
 
 static int uac_establish(const sip_config_t *cfg, sip_media_t *m)
@@ -601,15 +830,15 @@ static int uac_establish(const sip_config_t *cfg, sip_media_t *m)
     gen_hex(tok, 16);
     snprintf(m->call_id, sizeof(m->call_id), "%s@%s", tok, m->local_ip);
 
-    char from_tag[16], branch[20] = "z9hG4bK";
+    char from_tag[16], branch[20];
     gen_hex(from_tag, 10);
-    gen_hex(branch + 7, 12);
+    gen_branch(branch);
 
-    char realm[256] = "", nonce[256] = "";
+    char realm[256] = "", nonce[256] = "", qop[64] = "", opaque[192] = "";
     int cseq = 1, auth_tries = 0;
     char req[2048];
     int req_len = build_invite(m, cfg, target_uri, from_tag, branch, cseq,
-                               rtp_port, NULL, NULL, 0, req, sizeof(req));
+                               rtp_port, NULL, NULL, NULL, NULL, 0, req, sizeof(req));
     sip_send(m->sip_sock, req, req_len, &m->sip_peer);
     vlog(m, "TX", req);
     fprintf(stderr, "INVITE -> %s\n", target_uri);
@@ -624,7 +853,19 @@ static int uac_establish(const sip_config_t *cfg, sip_media_t *m)
 
     for (;;) {
         long wg = ts_until_ms(&giveup);
-        if (wg <= 0) { fprintf(stderr, "INVITE: no answer (timeout)\n"); return -1; }
+        if (wg <= 0) {
+            if (provisional) {
+                /* Ringing but no final response within Timer C: cancel it
+                 * cleanly (RFC 3261 §9.1) rather than abandon the callee. */
+                fprintf(stderr, "INVITE: no final response after %ds - cancelling\n",
+                        SIP_TIMER_C / 1000);
+                send_cancel(m, cfg, target_uri, from_tag, branch, cseq);
+                await_cancel_final(m, cfg, target_uri, from_tag, branch, cseq);
+            } else {
+                fprintf(stderr, "INVITE: no answer (timeout)\n");
+            }
+            return -1;
+        }
         long wt = provisional ? wg : ts_until_ms(&next_tx);
         long wms = wt < wg ? wt : wg;
         if (wms < 0) wms = 0;
@@ -647,7 +888,15 @@ static int uac_establish(const sip_config_t *cfg, sip_media_t *m)
 
         int code = sip_response_code(resp);
         if (code == 0) continue;            /* a request, not our response */
-        if (code < 200) { provisional = 1; continue; }
+        if (code < 200) {
+            /* A provisional (100/180/183...) moves us to Timer C: the callee is
+             * ringing, so wait much longer (>3 min) for a final response, reset
+             * on each provisional, and stop retransmitting the INVITE. */
+            provisional = 1;
+            clock_gettime(CLOCK_MONOTONIC, &giveup);
+            ts_add_ms(&giveup, SIP_TIMER_C);
+            continue;
+        }
 
         char to_hdr[300] = "";
         sip_hdr(resp, "To", to_hdr, sizeof(to_hdr));
@@ -658,11 +907,11 @@ static int uac_establish(const sip_config_t *cfg, sip_media_t *m)
                 fprintf(stderr, "INVITE: authentication failed\n");
                 return -1;
             }
-            challenge(resp, realm, nonce);
+            challenge(resp, realm, nonce, qop, opaque);
             cseq++;
-            strcpy(branch, "z9hG4bK"); gen_hex(branch + 7, 12);
+            gen_branch(branch);
             req_len = build_invite(m, cfg, target_uri, from_tag, branch, cseq,
-                                   rtp_port, realm, nonce, code == 407,
+                                   rtp_port, realm, nonce, qop, opaque, code == 407,
                                    req, sizeof(req));
             sip_send(m->sip_sock, req, req_len, &m->sip_peer);
             vlog(m, "TX", req);
@@ -747,6 +996,8 @@ static int uas_send_answer(const sip_config_t *cfg, sip_media_t *m,
             "Via: %s\r\nFrom: %s\r\nTo: %s\r\nCall-ID: %s\r\nCSeq: %s\r\n"
             "Content-Length: 0\r\n\r\n",
             code, ph, via, fr, to_with_tag, m->call_id, cseq);
+        if (n >= (int)sizeof(prov)) n = (int)sizeof(prov) - 1;   /* clamp the
+            snprintf would-be length before sendto (see sip_dialog_respond) */
         sip_send(m->sip_sock, prov, n, from);
     }
 
@@ -887,51 +1138,48 @@ int sip_media_establish(const sip_config_t *cfg, sip_media_t *m)
 
 /* ── Public: in-dialog SIP servicing + hangup ─────────────────────────── */
 
+/* The five dialog headers echoed back in a bodyless response. */
+struct sip_echo { char via[512], from[300], to[300], cid[256], cseq[64]; };
+static void sip_echo_hdrs(const char *req, struct sip_echo *e)
+{
+    e->via[0] = e->from[0] = e->to[0] = e->cid[0] = e->cseq[0] = '\0';
+    sip_hdr(req, "Via", e->via, sizeof e->via);
+    sip_hdr(req, "From", e->from, sizeof e->from);
+    sip_hdr(req, "To", e->to, sizeof e->to);
+    sip_hdr(req, "Call-ID", e->cid, sizeof e->cid);
+    sip_hdr(req, "CSeq", e->cseq, sizeof e->cseq);
+}
+
 /* Build and send a bodyless response that echoes a request's dialog headers
  * (used to answer an inbound BYE with 200, or decline a re-INVITE with 488).
  * For an in-dialog request the echoed To already carries our dialog tag. */
 void sip_dialog_respond(sip_media_t *m, const char *req,
                         const char *status, struct sockaddr_in *to)
 {
-    char via[512] = "", fr[300] = "", t[300] = "", cid[256] = "", cseq[64] = "";
-    sip_hdr(req, "Via", via, sizeof(via));
-    sip_hdr(req, "From", fr, sizeof(fr));
-    sip_hdr(req, "To", t, sizeof(t));
-    sip_hdr(req, "Call-ID", cid, sizeof(cid));
-    sip_hdr(req, "CSeq", cseq, sizeof(cseq));
-    char buf[1024];
-    int n = snprintf(buf, sizeof(buf),
+    struct sip_echo e;
+    sip_echo_hdrs(req, &e);
+    sip_sendf(m, to,
         "SIP/2.0 %s\r\n"
         "Via: %s\r\nFrom: %s\r\nTo: %s\r\nCall-ID: %s\r\nCSeq: %s\r\n"
         "Content-Length: 0\r\n\r\n",
-        status, via, fr, t, cid, cseq);
-    sip_send(m->sip_sock, buf, n, to);
-    vlog(m, "TX", buf);
+        status, e.via, e.from, e.to, e.cid, e.cseq);
 }
 
 /* Answer an in-dialog re-INVITE with 200 OK carrying our T.38 SDP. */
 static void respond_t38_200(sip_media_t *m, const char *req,
                             struct sockaddr_in *to, int t38_port)
 {
-    char via[512] = "", fr[300] = "", t[300] = "", cid[256] = "", cseq[64] = "";
-    sip_hdr(req, "Via", via, sizeof(via));
-    sip_hdr(req, "From", fr, sizeof(fr));
-    sip_hdr(req, "To", t, sizeof(t));
-    sip_hdr(req, "Call-ID", cid, sizeof(cid));
-    sip_hdr(req, "CSeq", cseq, sizeof(cseq));
+    struct sip_echo e;
+    sip_echo_hdrs(req, &e);
     char sdp[512];
     int sdp_len = build_t38_sdp(m->local_ip, t38_port, sdp, sizeof(sdp));
-    char buf[1024];
-    int n = snprintf(buf, sizeof(buf),
+    sip_sendf(m, to,
         "SIP/2.0 200 OK\r\n"
         "Via: %s\r\nFrom: %s\r\nTo: %s\r\nCall-ID: %s\r\nCSeq: %s\r\n"
         "Contact: <sip:%s@%s:%d>\r\n"
         "Content-Type: application/sdp\r\nContent-Length: %d\r\n\r\n%s",
-        via, fr, t, cid, cseq, m->local_user, m->local_ip, m->local_sip_port,
+        e.via, e.from, e.to, e.cid, e.cseq, m->local_user, m->local_ip, m->local_sip_port,
         sdp_len, sdp);
-    if (n >= (int) sizeof(buf)) n = (int) sizeof(buf) - 1;
-    sip_send(m->sip_sock, buf, n, to);
-    vlog(m, "TX", buf);
 }
 
 /* Daemon helper: accept an in-dialog T.38 re-INVITE on dialog `dlg`, answering
@@ -969,6 +1217,26 @@ void sip_t38_reanswer(sip_media_t *dlg, const char *req, struct sockaddr_in *fro
     respond_t38_200(dlg, req, from, local_port);
 }
 
+/* Does this inbound request belong to our established dialog? An in-dialog
+ * BYE/re-INVITE is honoured only if its Call-ID matches AND it arrives from
+ * the signalling peer captured at establish time (the proxy on the UAC path,
+ * the INVITE source on the UAS path). Without this, any host that can reach
+ * our SIP port could tear the call down with a bare BYE, or redirect our
+ * media to an attacker-chosen address with a re-INVITE carrying a crafted
+ * SDP c= line. Tag matching would be stricter, but this stack keeps only the
+ * composite From/To header values, so Call-ID + source address is the check. */
+static int in_dialog(const sip_media_t *m, const char *req,
+                     const struct sockaddr_in *from)
+{
+    char cid[256] = "";
+    sip_hdr(req, "Call-ID", cid, sizeof(cid));
+    if (m->call_id[0] == '\0' || strcmp(cid, m->call_id) != 0)
+        return 0;
+    if (from->sin_addr.s_addr != m->sip_peer.sin_addr.s_addr)
+        return 0;
+    return 1;
+}
+
 int sip_media_poll_sip(sip_media_t *m)
 {
     char buf[8192];
@@ -990,6 +1258,17 @@ int sip_media_poll_sip(sip_media_t *m)
 
     char method[32];
     sip_method(buf, method, sizeof(method));
+
+    /* Only in-dialog requests from our peer may tear down or renegotiate the
+     * call; anything else on the port is ignored (no teardown, no media move). */
+    if ((strcasecmp(method, "BYE") == 0 || strcasecmp(method, "INVITE") == 0) &&
+        !in_dialog(m, buf, &from)) {
+        if (m->verbose)
+            fprintf(stderr, "ignoring off-dialog %s (Call-ID/source mismatch)\n",
+                    method);
+        return 0;
+    }
+
     if (strcasecmp(method, "BYE") == 0) {
         sip_dialog_respond(m, buf, "200 OK", &from);
         m->peer_hung_up = 1;
@@ -1037,10 +1316,9 @@ int sip_media_poll_sip(sip_media_t *m)
 void sip_call_send_bye(sip_media_t *m)
 {
     if (m->sip_sock < 0 || !m->bye_ruri[0]) return;
-    char branch[20] = "z9hG4bK";
-    gen_hex(branch + 7, 12);
-    char bye[1024];
-    int n = snprintf(bye, sizeof(bye),
+    char branch[20];
+    gen_branch(branch);
+    sip_sendf(m, &m->sip_peer,
         "BYE %s SIP/2.0\r\n"
         "Via: SIP/2.0/UDP %s:%d;branch=%s;rport\r\n"
         "Max-Forwards: 70\r\n"
@@ -1052,15 +1330,13 @@ void sip_call_send_bye(sip_media_t *m)
         "\r\n",
         m->bye_ruri, m->local_ip, m->local_sip_port, branch,
         m->bye_from, m->bye_to, m->call_id, m->cseq);
-    sip_send(m->sip_sock, bye, n, &m->sip_peer);
-    vlog(m, "TX", bye);
 }
 
 /* Send an in-dialog ACK (new branch) for a 2xx to our re-INVITE. */
 static void t38_send_ack(sip_media_t *m, const char *to_hdr, int cseq)
 {
-    char branch[20] = "z9hG4bK";
-    gen_hex(branch + 7, 12);
+    char branch[20];
+    gen_branch(branch);
     char ack[1024];
     int n = snprintf(ack, sizeof(ack),
         "ACK %s SIP/2.0\r\n"
@@ -1069,6 +1345,7 @@ static void t38_send_ack(sip_media_t *m, const char *to_hdr, int cseq)
         "CSeq: %d ACK\r\nContent-Length: 0\r\n\r\n",
         m->bye_ruri, m->local_ip, m->local_sip_port, branch,
         m->bye_from, to_hdr, m->call_id, cseq);
+    if (n >= (int)sizeof(ack)) n = (int)sizeof(ack) - 1;   /* clamp before sendto */
     sip_send(m->sip_sock, ack, n, &m->sip_peer);
 }
 
@@ -1082,17 +1359,16 @@ int sip_offer_t38(sip_media_t *m, const sip_config_t *cfg)
     { struct sockaddr_in a; socklen_t sl = sizeof(a);
       getsockname(m->t38_sock, (struct sockaddr *) &a, &sl); lp = ntohs(a.sin_port); }
 
-    char realm[256] = "", nonce[256] = "";
+    char realm[256] = "", nonce[256] = "", qop[64] = "", opaque[192] = "";
     for (int attempt = 0; attempt < 2; attempt++) {
         int my_cseq = m->cseq++;
-        char branch[20] = "z9hG4bK"; gen_hex(branch + 7, 12);
+        char branch[20]; gen_branch(branch);
         char sdp[512]; int sdp_len = build_t38_sdp(m->local_ip, lp, sdp, sizeof(sdp));
-        char auth[700] = "";
+        char auth[900] = "";
         if (attempt == 1 && realm[0] && cfg->password[0])
             build_auth(cfg->local_user, cfg->password, "INVITE", m->bye_ruri,
-                       realm, nonce, 0, auth, sizeof(auth));
-        char req[2048];
-        int n = snprintf(req, sizeof(req),
+                       realm, nonce, qop, opaque, 0, auth, sizeof(auth));
+        sip_sendf(m, &m->sip_peer,
             "INVITE %s SIP/2.0\r\n"
             "Via: SIP/2.0/UDP %s:%d;branch=%s;rport\r\n"
             "Max-Forwards: 70\r\nFrom: %s\r\nTo: %s\r\nCall-ID: %s\r\n"
@@ -1101,9 +1377,6 @@ int sip_offer_t38(sip_media_t *m, const sip_config_t *cfg)
             m->bye_ruri, m->local_ip, m->local_sip_port, branch,
             m->bye_from, m->bye_to, m->call_id, my_cseq,
             cfg->local_user, m->local_ip, m->local_sip_port, auth, sdp_len, sdp);
-        if (n >= (int) sizeof(req)) n = (int) sizeof(req) - 1;
-        sip_send(m->sip_sock, req, n, &m->sip_peer);
-        vlog(m, "TX", req);
 
         int retry = 0;
         for (;;) {
@@ -1114,7 +1387,7 @@ int sip_offer_t38(sip_media_t *m, const sip_config_t *cfg)
             int code = sip_response_code(resp);
             if (code == 0) {                            /* a request mid-transaction */
                 char meth[32]; sip_method(resp, meth, sizeof(meth));
-                if (strcasecmp(meth, "BYE") == 0) {
+                if (strcasecmp(meth, "BYE") == 0 && in_dialog(m, resp, &src)) {
                     sip_dialog_respond(m, resp, "200 OK", &src);
                     m->peer_hung_up = 1;
                     return 0;
@@ -1136,7 +1409,7 @@ int sip_offer_t38(sip_media_t *m, const sip_config_t *cfg)
             }
             if ((code == 401 || code == 407) && attempt == 0 && cfg->password[0]) {
                 t38_send_ack(m, to_hdr[0] ? to_hdr : m->bye_to, my_cseq); /* ACK the 4xx */
-                challenge(resp, realm, nonce);
+                challenge(resp, realm, nonce, qop, opaque);
                 retry = 1;
                 break;
             }
@@ -1238,28 +1511,20 @@ void sip_call_resend_ok(sip_media_t *call, struct sockaddr_in *to)
 void sip_uas_decline(sip_media_t *listen, const char *invite,
                      struct sockaddr_in *from, const char *status)
 {
-    char via[512] = "", fr[300] = "", to[300] = "", cid[256] = "", cseq[64] = "";
-    sip_hdr(invite, "Via", via, sizeof(via));
-    sip_hdr(invite, "From", fr, sizeof(fr));
-    sip_hdr(invite, "To", to, sizeof(to));
-    sip_hdr(invite, "Call-ID", cid, sizeof(cid));
-    sip_hdr(invite, "CSeq", cseq, sizeof(cseq));
+    struct sip_echo e;
+    sip_echo_hdrs(invite, &e);
 
     char to_tag[18];
     gen_hex(to_tag, 16);
     char to_t[330];
-    if (strstr(to, ";tag="))
-        snprintf(to_t, sizeof(to_t), "%s", to);
+    if (strstr(e.to, ";tag="))
+        snprintf(to_t, sizeof(to_t), "%s", e.to);
     else
-        snprintf(to_t, sizeof(to_t), "%s;tag=%s", to, to_tag);
+        snprintf(to_t, sizeof(to_t), "%s;tag=%s", e.to, to_tag);
 
-    char buf[1024];
-    int n = snprintf(buf, sizeof(buf),
+    sip_sendf(listen, from,
         "SIP/2.0 %s\r\n"
         "Via: %s\r\nFrom: %s\r\nTo: %s\r\nCall-ID: %s\r\nCSeq: %s\r\n"
         "Content-Length: 0\r\n\r\n",
-        status, via, fr, to_t, cid, cseq);
-    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
-    sip_send(listen->sip_sock, buf, n, from);
-    vlog(listen, "TX", buf);
+        status, e.via, e.from, to_t, e.cid, e.cseq);
 }

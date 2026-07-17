@@ -51,6 +51,11 @@ regression harnesses):
   short-train sequences, and tx level calibration. The end-to-end impairment
   acceptance gate is `../sweep.sh` (see below).
 
+For the full set of fax modem modes and rates — the call-setup tones, V.8
+negotiation, the V.21 control channel, the V.17/V.29/V.27ter fallback ladder,
+V.34 "Super G3", and the T.38 mapping — see
+[docs/MODEM_MODES.md](docs/MODEM_MODES.md).
+
 It interoperates with real spandsp in both directions (verified: `nf_t30` ↔
 spandsp, pixel-perfect, in non-ECM and ECM). Regression harnesses: `make check`
 (offline codec vs spandsp), `make check-fax` (full own-engine call + non-ECM
@@ -163,6 +168,7 @@ Each received fax produces a pair of files named after one random token:
 |-----------------------|-------------------------------------------------------|
 | `<rand>.tiff`         | the received fax — a Group-4 multi-page TIFF (or an RGB/greyscale TIFF for a colour/grey page), exactly as `--receive` writes |
 | `<rand>.invite`       | a verbatim copy of the call's original SIP INVITE     |
+| `<rand>.meta`         | fax metadata: remote station id (TSI/CSI), receive time, pages, resolution, bit rate, G3/Super-G3, ECM |
 
 e.g. `a3f1c0d9e2b48157.tiff` alongside `a3f1c0d9e2b48157.invite`.
 
@@ -613,9 +619,23 @@ tiff2pdf out.tiff -o out.pdf    # view all pages
 ## Notes / non-goals
 
 - One call/connection, one fax per run. No reconnect/retry logic.
+- **Station identifier.** `--ident <str>` sets the local 20-char station id sent
+  in T.30 phase B as TSI (transmitting), CSI (answering) or CIG (polling); the
+  remote's id is logged at Phase E and stored in the received TIFF's
+  `ImageDescription`/`Software`/`DateTime` tags (and the daemon `.meta` sidecar).
+  Empty (`--ident ""`) sends none.
 - `--receive` always writes TIFF.
 - `--verbose` enables `nf_t30`'s own T.30 protocol logging (and one-line SIP
   traffic logging) for debugging.
+- `--debug` (optionally `--debug-dir <dir>`) is one switch for analysing a
+  failed call. It implies `--verbose`, additionally logs **whole** SIP messages
+  and the lower-layer T.30/V.34/T.38 traces, prefixes every log line with a
+  wall-clock timestamp (so SIP and T.30 events can be correlated), and collects
+  the artifacts under an auto-named directory (or `--debug-dir`):
+  `session.log` (the full trace), `rx.pcm` (inbound decoded audio) and
+  `report.txt` (a post-mortem of the negotiated modem/rate/ECM and outcome).
+  Replay the captured audio through the receiver offline with
+  `--replay-rx <dir>/rx.pcm --receive out.tiff --verbose`.
 - **Colour fax** is the T.42/T.81 (CIELAB + baseline JPEG) continuous-tone mode
   only; T.43/T.45 codings, greyscale-only mode, 12-bit components, higher colour
   resolutions, and non-default illuminant/gamut are not implemented. Colour and
@@ -623,10 +643,15 @@ tiff2pdf out.tiff -o out.pdf    # view all pages
   physical colour fax machine). The binary-file profile is private, not T.434.
 - **ECM scope:** the common path — FCD/RCP frames, PPS, PPR-driven
   retransmission, multi-block and multi-page — is implemented and interop-tested.
-  The rarer escalation signals (CTC/CTR rate-drop, EOR/ERR, RNR/RR flow control)
-  are handled minimally; `nf_t30` instead caps the retransmission rounds and, if a
-  block still cannot be completed, disconnects. Clean-channel and single-loss
-  cases (the usual ones) are covered.
+  The **CTC/CTR rate-fallback** ladder (T.30 Annex A.4.3) is implemented on both
+  the sending and receiving side: after 4 consecutive PPRs for a block the sender
+  drops a modem step (CTC) and continues correcting at the lower rate, repeating
+  down the fallback table; at the lowest rate a block that still cannot be
+  delivered is ended with **EOR/ERR** and the call fails cleanly. This lets a
+  marginal line that only works at a lower speed complete instead of looping. See
+  `make check-ctc`. RNR/RR flow control is still handled minimally. Over V.34
+  (Annex F) the classic CTC ladder does not apply — the primary-channel rate is
+  governed by V.34 itself — so there the sender falls back to bounded resends.
 
 ### SIP stack scope
 

@@ -59,6 +59,7 @@ typedef struct {
     uint32_t          rtp_ts;
     uint32_t          rtp_ssrc;
     int               have_rtp_dest;
+    int               rtp_latched;    /* symmetric-RTP source adopted + locked */
 
     int               log_callid;     /* prefix SIP log lines with call_id (daemon) */
 
@@ -81,6 +82,7 @@ typedef struct {
     int               t38_sock;        /* UDPTL socket, or -1                */
     int               t38_active;      /* media has switched to T.38         */
     struct sockaddr_in t38_peer;       /* peer's UDPTL address               */
+    int               t38_latched;     /* symmetric UDPTL source adopted + locked */
     int               t38_far_datagram;/* peer's T38FaxMaxDatagram           */
 } sip_media_t;
 

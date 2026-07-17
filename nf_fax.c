@@ -6,6 +6,8 @@
 #include "nf_v29.h"
 #include "nf_v27.h"
 #include "nf_v17.h"
+#include "nf_v8.h"
+#include "nf_v34.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -102,7 +104,9 @@ static int nf_tone_tx(void *user, int16_t *amp, int max_len)
 
 enum {                                  /* rx dispatch mode */
     RX_NONE = 0, RX_V21, RX_FAST_PARALLEL, RX_FAST_ONLY, RX_V21_ONLY,
-    RX_FAST_AND_V21      /* ECM image: fast modem (HDLC) + V.21 (own HDLC) parallel */
+    RX_FAST_AND_V21,     /* ECM image: fast modem (HDLC) + V.21 (own HDLC) parallel */
+    RX_V8,               /* T.30 Annex F handshake (full duplex, see nf_v8.h)       */
+    RX_V34               /* V.34 half-duplex session (see nf_v34.h)                 */
 };
 
 struct nf_fax {
@@ -119,9 +123,20 @@ struct nf_fax {
     nf_hdlc_rx_t hdlc_rx_v21;    /* V.21's own HDLC, so it can run in parallel  */
     struct nf_tonegen tone;
     struct nf_silence silence;
+    nf_v8_t v8;
+    nf_v34_sess_t *v34;             /* V.34 half-duplex session, lazily made  */
+    uint32_t v8_our_modulations;    /* offered, set by nf_fax_set_v8_caps()   */
+    int32_t  v8_our_call_function;
+    uint32_t v8_result_modulations; /* negotiated, valid once V.8 resolves    */
+    int32_t  v8_result_call_function;
 
     /* rx state */
     int rx_mode;
+    /* last ~1 s of raw rx audio, kept so a freshly started V.34 session can
+     * be primed with the V.8 tail it would otherwise never have heard (the
+     * answerer's single INFO0a can start before our CJ hold ends) */
+    int16_t rx_hist[8000];
+    int rx_hist_n;
     int fast_rx_type;          /* NF_MODEM_V17/V29/V27TER while parallel/fast */
     int fast_bit_rate;         /* rate/train of the active fast rx (for re-acquire) */
     int fast_short_train;
@@ -165,6 +180,7 @@ static int xlat_status(int sig)
     case NF_SIG_CARRIER_DOWN:       return NF_STATUS_CARRIER_DOWN;
     case NF_SIG_TRAINING_SUCCEEDED: return NF_STATUS_TRAINING_SUCCEEDED;
     case NF_SIG_TRAINING_FAILED:    return NF_STATUS_TRAINING_FAILED;
+    case NF_SIG_SEND_COMPLETE:      return NF_STATUS_SEND_STEP_COMPLETE;
     default:                        return 0;
     }
 }
@@ -272,6 +288,70 @@ static void v21_rx_status(void *user, int status)
     DBG("%c v21 rx status=%d\n", s->calling ? 'C' : 'A', status);
 }
 
+/* T.30 Annex F handshake result: reuses the TRAINING_SUCCEEDED/FAILED status
+ * events (V.8 negotiated / didn't) so nf_t30 can react through the same path
+ * it already uses for every other modem's training outcome. */
+static void v8_status(void *user, int status, const nf_v8_result_t *r)
+{
+    nf_fax_t *s = user;
+    s->v8_result_modulations = r->modulations;
+    s->v8_result_call_function = r->call_function;
+    DBG("%c v8 status=%d cf=%d mod=0x%04X answer-tone=%s\n", s->calling ? 'C' : 'A',
+        status, r->call_function, r->modulations,
+        r->ansam_am == 1 ? "ANSam(AM,V.8 offered)" :
+        r->ansam_am == 0 ? "plain-CED(no-AM,no-V.8)" : "n/a");
+    emit_status(s, status == NF_V8_STATUS_V8_CALL
+                   ? NF_STATUS_TRAINING_SUCCEEDED : NF_STATUS_TRAINING_FAILED);
+}
+
+/* ── V.34 half-duplex session glue (T.30 Annex F) ──────────────────────
+ * The session engine (nf_v34.c) reports NF_SIG_* statuses and delivers
+ * FCS-checked HDLC frames from both the control and primary channels; both
+ * are translated onto the same up-interface every other modem uses. */
+
+static void v34_status_handler(void *user, int status)
+{
+    nf_fax_t *s = user;
+    int nf = xlat_status(status);
+
+    DBG("%c v34 status=%d\n", s->calling ? 'C' : 'A', status);
+    if (nf) emit_status(s, nf);
+}
+
+static void v34_frame_handler(void *user, const uint8_t *msg, int len, int ok)
+{
+    nf_fax_t *s = user;
+
+    if (len >= 0 && ok) s->rx_frame_received = 1;
+    if (len >= 0 && s->up.hdlc_accept) s->up.hdlc_accept(s->up.user, msg, len, ok);
+}
+
+static int v34_get_frame_shim(void *user, uint8_t *buf, int maxlen)
+{
+    nf_fax_t *s = user;
+
+    return s->up.hdlc_get_frame ? s->up.hdlc_get_frame(s->up.user, buf, maxlen) : 0;
+}
+
+static nf_v34_sess_t *ensure_v34(nf_fax_t *s)
+{
+    if (!s->v34)
+        s->v34 = nf_v34_sess_alloc(s->calling, v34_status_handler,
+                                   v34_frame_handler, s);
+    return s->v34;
+}
+
+static int v34_sub_mode(int bit_rate)
+{
+    /* nf_t30 selects the channel, not the rate: anything above the 2400
+     * bit/s control-channel ceiling means "primary channel" (the actual
+     * primary rate is negotiated inside the session via MPh - see
+     * nf_fax_v34_bit_rate) */
+    if (bit_rate > 2400)  return NF_V34_SESS_PRI;
+    if (bit_rate > 0)     return NF_V34_SESS_CC;
+    return NF_V34_SESS_STARTUP;
+}
+
 /* ── construction ──────────────────────────────────────────────────── */
 
 nf_fax_t *nf_fax_init(int calling_party, const nf_fax_iface_t *iface)
@@ -314,13 +394,31 @@ nf_fax_t *nf_fax_init(int calling_party, const nf_fax_iface_t *iface)
 void nf_fax_free(nf_fax_t *s)
 {
     if (!s) return;
+    nf_v34_sess_free(s->v34);
     free(s);
 }
 
 void nf_fax_set_transmit_on_idle(nf_fax_t *s, int on) { s->transmit_on_idle = on; }
 
+void nf_fax_set_v8_caps(nf_fax_t *s, uint32_t modulations, int32_t call_function)
+{
+    s->v8_our_modulations = modulations;
+    s->v8_our_call_function = call_function;
+}
+uint32_t nf_fax_v8_modulations(const nf_fax_t *s)   { return s->v8_result_modulations; }
+int32_t  nf_fax_v8_call_function(const nf_fax_t *s) { return s->v8_result_call_function; }
+
+int nf_fax_v34_bit_rate(const nf_fax_t *s)
+{
+    return s->v34 ? nf_v34_sess_data_rate(s->v34) : 0;
+}
+
 void nf_fax_send_hdlc(nf_fax_t *s, const uint8_t *msg, int len)
 {
+    if (s->current_tx_type == NF_MODEM_V34 && s->v34) {
+        nf_v34_sess_queue_frame(s->v34, msg, len);      /* len < 0 clears */
+        return;
+    }
     if (len < 0) { nf_hdlc_tx_restart(&s->hdlc_tx); return; }
     nf_hdlc_tx_frame(&s->hdlc_tx, msg, len);
     /* Mark end-of-transmission so the carrier ends cleanly after the closing
@@ -330,6 +428,12 @@ void nf_fax_send_hdlc(nf_fax_t *s, const uint8_t *msg, int len)
 
 void nf_fax_begin_hdlc_stream(nf_fax_t *s)
 {
+    if (s->current_tx_type == NF_MODEM_V34 && s->v34) {
+        /* the session pulls the whole block on its next tx pump (after the
+         * protocol layer's state is in place) and plays it as one burst */
+        nf_v34_sess_begin_stream(s->v34, v34_get_frame_shim, s);
+        return;
+    }
     /* The current modem was just set up with use_hdlc; its flag preamble will
      * trigger the first underflow, which pulls frame 0, and so on. */
     s->hdlc_stream = 1;
@@ -388,6 +492,22 @@ void nf_fax_set_rx_type(nf_fax_t *s, int type, int bit_rate, int short_train, in
         nf_v17_rx_set_status_handler(&s->v17_rx, fast_rx_status, s);
         s->fast_rx_type = type; s->rx_mode = use_hdlc ? RX_FAST_AND_V21 : RX_FAST_PARALLEL;
         break;
+    case NF_MODEM_V8:
+        /* nf_v8_init() itself happens in nf_fax_set_tx_type() (also always
+         * called for this phase, and it owns the one nf_v8_t engine); this
+         * just points the rx dispatch at it. */
+        s->rx_mode = RX_V8;
+        break;
+    case NF_MODEM_V34:
+        ensure_v34(s);
+        if (s->v34) {
+            nf_v34_sess_set_rx_mode(s->v34, v34_sub_mode(bit_rate));
+            /* new session: replay the rx history (the V.8 tail) into the
+             * Phase-2 receiver; a no-op at any later set_rx_type */
+            nf_v34_sess_rx_prime(s->v34, s->rx_hist, s->rx_hist_n);
+            s->rx_mode = RX_V34;
+        }
+        break;
     default:
         s->rx_mode = RX_NONE;
         break;
@@ -396,6 +516,24 @@ void nf_fax_set_rx_type(nf_fax_t *s, int type, int bit_rate, int short_train, in
 
 int nf_fax_rx(nf_fax_t *s, const int16_t *amp, int len)
 {
+    /* keep the rolling rx history current BEFORE dispatching, so a mode
+     * switch triggered from inside a handler (V.8 completing mid-chunk)
+     * can prime the V.34 session with everything up to and including the
+     * present chunk */
+    if (len > 0) {
+        int cap = (int) (sizeof(s->rx_hist) / sizeof(s->rx_hist[0]));
+        int n = len > cap ? cap : len;
+        if (s->rx_hist_n + n > cap) {
+            int keep = cap - n;
+            memmove(s->rx_hist, s->rx_hist + s->rx_hist_n - keep,
+                    (size_t) keep * sizeof(int16_t));
+            s->rx_hist_n = keep;
+        }
+        memcpy(s->rx_hist + s->rx_hist_n, amp + (len - n),
+               (size_t) n * sizeof(int16_t));
+        s->rx_hist_n += n;
+    }
+
     switch (s->rx_mode) {
     case RX_V21:
     case RX_V21_ONLY:
@@ -429,6 +567,12 @@ int nf_fax_rx(nf_fax_t *s, const int16_t *amp, int len)
         case NF_MODEM_V29: nf_v29_rx(&s->v29_rx, amp, len); break;
         case NF_MODEM_V27TER: nf_v27_rx(&s->v27_rx, amp, len); break;
         }
+        break;
+    case RX_V8:
+        nf_v8_rx(&s->v8, amp, len);
+        break;
+    case RX_V34:
+        nf_v34_sess_rx(s->v34, amp, len);
         break;
     default:
         break;
@@ -498,6 +642,31 @@ void nf_fax_set_tx_type(nf_fax_t *s, int type, int bit_rate, int short_train, in
         set_tx(s, nf_silence_tx, &s->silence);
         set_next_tx(s, (nf_tx_fn) nf_v17_tx, &s->v17_tx);
         s->transmit = 1;
+        break;
+    case NF_MODEM_V8:
+        /* Full duplex, no finite "burst": nf_v8_tx() always fills the buffer
+         * (silence, ANSam, or FSK bits) and only ever stops being pumped when
+         * nf_t30 switches to a different tx type on TRAINING_SUCCEEDED/FAILED
+         * (see v8_status()) - same non-terminating shape as CED/CNG above. */
+        nf_v8_init(&s->v8, s->calling, s->v8_our_modulations, s->v8_our_call_function,
+                  v8_status, s);
+        set_tx(s, (nf_tx_fn) nf_v8_tx, &s->v8);
+        set_next_tx(s, NULL, NULL);
+        s->transmit = 1;
+        break;
+    case NF_MODEM_V34:
+        /* bit_rate 0 = clause-12 startup (infinite generator, like V.8);
+         * 1200 = one control-channel burst; 24000 = one primary-channel
+         * burst. The finite bursts return short when played out, which is
+         * what yields NF_STATUS_SEND_STEP_COMPLETE through the generic tx
+         * pump below. */
+        ensure_v34(s);
+        if (s->v34) {
+            nf_v34_sess_set_tx_mode(s->v34, v34_sub_mode(bit_rate));
+            set_tx(s, (nf_tx_fn) nf_v34_sess_tx, s->v34);
+            set_next_tx(s, NULL, NULL);
+            s->transmit = 1;
+        }
         break;
     default:                            /* NONE / DONE */
         set_tx(s, nf_silence_tx, &s->silence);

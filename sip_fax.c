@@ -21,6 +21,9 @@
 #include <getopt.h>
 #include <errno.h>
 #include <signal.h>
+#include <time.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <sys/select.h>
@@ -513,9 +516,14 @@ static void phase_e_handler(void *user_data, int result)
     fprintf(stderr, "Phase E: %s\n", nf_t30_completion_to_str(result));
     if (result == NF_T30_OK) {
         if (cs->tag) fprintf(stderr, "[%s] ", cs->tag);
-        fprintf(stderr, "  pages tx=%d rx=%d, %dx%d, %d bps\n",
+        fprintf(stderr, "  pages tx=%d rx=%d, %dx%d, %d bps (%s)\n",
                 stats.pages_tx, stats.pages_rx,
-                stats.width, stats.length, stats.bit_rate);
+                stats.width, stats.length, stats.bit_rate,
+                stats.v34 ? "Super G3 / V.34" : "G3");
+        if (stats.rx_ident[0]) {
+            if (cs->tag) fprintf(stderr, "[%s] ", cs->tag);
+            fprintf(stderr, "  remote station id: %s\n", stats.rx_ident);
+        }
         if (cs->doc && cs->doc->chosen_kind)
             fprintf(stderr, "  sent the %s version\n", cs->doc->chosen_kind);
         else if (cs->doc && cs->doc->chosen >= 0)
@@ -608,6 +616,156 @@ static int g_color_quality = 85; /* JPEG quality for colour tx                  
 static int g_calling    = 0;     /* T.30 calling party (CNG); else answer (CED) */
 static int g_poll_serve = 0;     /* answer side: transmit our doc when polled   */
 static int g_poll_recv  = 0;     /* call side: poll for a doc, then receive     */
+static int g_v34        = 1;     /* offer V.34 (Super G3) in V.8; --no-v34 opts out.
+                                  * Default on, matching a real SG3 machine: V.8
+                                  * settles on the best common modulation, so a
+                                  * peer without V.34 (or without V.8 at all)
+                                  * falls back cleanly to classic G3.           */
+static int g_require_v34 = 0;    /* --require-v34: abort (DCN, exit 1) instead of
+                                  * falling back to classic G3 when V.8 fails to
+                                  * negotiate V.34. Aborts before any page tx.   */
+static int g_auto_redial = 1;    /* when a dialed V.34 call fails, redial once
+                                  * with V.34 suppressed (classic G3): some SG3
+                                  * machines advertise capabilities (e.g. JPEG)
+                                  * their V.34 stack cannot actually receive.
+                                  * --no-redial opts out.                       */
+static int g_last_v34_failed = 0;/* the call just run negotiated V.34 and did
+                                  * not complete cleanly (set by run_fax_sip)   */
+
+/* ------------------------------------------------------------------ */
+/* --debug: one switch that captures everything needed to analyse a    */
+/* failed call offline (SIP + T.30 + modem trace, inbound audio, and a */
+/* copy of the whole trace to <dir>/session.log).                      */
+/* ------------------------------------------------------------------ */
+static char g_debug_dir[512];   /* set non-empty when --debug is active */
+
+/* Tee stderr to <dir>/session.log while still echoing to the console. A small
+ * forked relay copies the pipe to both sinks; no pthread dependency, and it
+ * survives the daemon's own forks (children inherit the redirected fd 2). */
+static void debug_tee_stderr(const char *logpath)
+{
+    int fd = open(logpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { perror("debug: open session.log"); return; }
+
+    int pipefd[2];
+    if (pipe(pipefd) < 0) { perror("debug: pipe"); close(fd); return; }
+
+    int console = dup(STDERR_FILENO);   /* the real terminal/stderr */
+    if (console < 0) { close(fd); close(pipefd[0]); close(pipefd[1]); return; }
+
+    pid_t pid = fork();
+    if (pid < 0) { perror("debug: fork"); close(fd); close(pipefd[0]); close(pipefd[1]); close(console); return; }
+
+    if (pid == 0) {
+        /* relay: read the pipe, write each chunk to console + logfile */
+        close(pipefd[1]);
+        signal(SIGINT, SIG_IGN); signal(SIGTERM, SIG_IGN);
+        char buf[4096];
+        ssize_t n;
+        while ((n = read(pipefd[0], buf, sizeof buf)) > 0) {
+            ssize_t off = 0;
+            while (off < n) { ssize_t w = write(console, buf + off, (size_t)(n - off)); if (w <= 0) break; off += w; }
+            off = 0;
+            while (off < n) { ssize_t w = write(fd, buf + off, (size_t)(n - off)); if (w <= 0) break; off += w; }
+        }
+        _exit(0);
+    }
+
+    /* parent: stderr now flows into the relay */
+    dup2(pipefd[1], STDERR_FILENO);
+    close(pipefd[0]); close(pipefd[1]); close(fd); close(console);
+    setvbuf(stderr, NULL, _IOLBF, 0);   /* line-buffered so the log stays live */
+}
+
+/* Turn on every diagnostic knob under one flag. `dir` may be NULL (auto name).
+ * Returns the chosen directory (points into g_debug_dir). */
+static const char *setup_debug(const char *dir)
+{
+    if (dir && dir[0]) {
+        snprintf(g_debug_dir, sizeof g_debug_dir, "%s", dir);
+    } else {
+        time_t now = time(NULL);
+        struct tm tm;
+        localtime_r(&now, &tm);
+        snprintf(g_debug_dir, sizeof g_debug_dir,
+                 "faxdbg-%04d%02d%02d-%02d%02d%02d-%d",
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                 tm.tm_hour, tm.tm_min, tm.tm_sec, (int) getpid());
+    }
+    if (mkdir(g_debug_dir, 0755) < 0 && errno != EEXIST)
+        fprintf(stderr, "debug: mkdir %s: %s\n", g_debug_dir, strerror(errno));
+
+    /* Lower-layer traces (T.30 frame dispatch, V.34 session, T.38 IFP). */
+    setenv("NFFAXDBG", "1", 0);
+    setenv("NFV34DBG", "1", 0);
+    setenv("NF_T38_DBG", "1", 0);
+    /* Our own logging: full SIP messages + wall-clock timestamps. */
+    setenv("NF_SIP_FULL", "1", 0);
+    setenv("NF_LOG_TS", "1", 0);
+    /* Capture inbound decoded PCM for offline replay (--replay-rx), unless the
+     * caller already pointed it somewhere. 16-bit LE, 8 kHz, mono. */
+    if (!getenv("NF_RX_AUDIO_DUMP")) {
+        static char pcm[600];
+        snprintf(pcm, sizeof pcm, "%s/rx.pcm", g_debug_dir);
+        setenv("NF_RX_AUDIO_DUMP", pcm, 1);
+    }
+
+    char logpath[600];
+    snprintf(logpath, sizeof logpath, "%s/session.log", g_debug_dir);
+    debug_tee_stderr(logpath);
+
+    fprintf(stderr,
+        "=== sip_fax debug mode ===\n"
+        "  artifacts   : %s/\n"
+        "    session.log   full SIP + T.30 + modem trace (this output)\n"
+        "    rx.pcm        inbound audio, replay with:\n"
+        "                    sip_fax --replay-rx %s/rx.pcm --receive out.tiff --verbose\n"
+        "==========================\n",
+        g_debug_dir, g_debug_dir);
+    return g_debug_dir;
+}
+
+/* Append a one-shot post-mortem to <dir>/report.txt (and echo it): the
+ * negotiated parameters and outcome, so a failure can be triaged at a glance. */
+static void debug_write_report(nf_t30_t *fax, int sending, int rc)
+{
+    if (!g_debug_dir[0] || !fax) return;
+    nf_t30_stats_t st;
+    nf_t30_get_stats(fax, &st);
+
+    char path[600];
+    snprintf(path, sizeof path, "%s/report.txt", g_debug_dir);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+
+    time_t now = time(NULL);
+    struct tm tm; localtime_r(&now, &tm);
+    char when[32];
+    strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", &tm);
+
+    fprintf(f,
+        "sip_fax debug report\n"
+        "  time            : %s\n"
+        "  role            : %s\n"
+        "  outcome         : %s (rc=%d)\n"
+        "  remote id       : %s\n"
+        "  modem           : %s\n"
+        "  bit rate        : %d bps\n"
+        "  ECM             : %s\n"
+        "  pages sent      : %d\n"
+        "  pages received  : %d\n",
+        when,
+        sending ? "sender" : "receiver",
+        rc == 0 ? "OK" : "FAILED", rc,
+        st.rx_ident[0] ? st.rx_ident : "(none)",
+        nf_t30_modem_name(fax),
+        st.bit_rate,
+        st.ecm ? "yes" : "no",
+        st.pages_tx, st.pages_rx);
+    fclose(f);
+
+    fprintf(stderr, "debug: wrote %s\n", path);
+}
 
 static nf_t30_t *fax_open(int sending, const char *file, const char *ident,
                           int verbose, struct call_state *cs)
@@ -623,6 +781,12 @@ static nf_t30_t *fax_open(int sending, const char *file, const char *ident,
     if (g_poll_serve) nf_t30_set_poll_serve(eng, 1);
     if (g_poll_recv)  nf_t30_set_poll_receive(eng, 1);
     nf_t30_set_ecm(eng, g_use_ecm);
+    /* V.34 (T.30 Annex F) half-duplex fixes the primary-channel image direction
+     * to caller->answerer. Polling reverses the document direction (the answerer
+     * is the image source), which the V.34 session engine does not yet support,
+     * so polling calls always use classic G3 (still negotiated via V.8). */
+    nf_t30_set_v34(eng, g_v34 && !g_poll_serve && !g_poll_recv);
+    nf_t30_set_require_v34(eng, g_require_v34);
     nf_t30_set_tx_ident(eng, ident);
     nf_t30_set_phase_e_handler(eng, phase_e_handler, cs);
     if (verbose) nf_t30_set_verbose(eng, 1);
@@ -720,13 +884,40 @@ static void tx_progress(nf_t30_t *fax, struct timespec *next, int *mode,
     if (eta >= 0) snprintf(etabuf, sizeof etabuf, "%ld:%02ld", eta / 60, eta % 60);
     else          snprintf(etabuf, sizeof etabuf, "?");
 
+    const char *modem = nf_t30_modem_name(fax);
     if (*mode == 1)
-        fprintf(stderr, "\r[fax] page %d/%d  %3.0f%%  %zu/%zu B  ETA %s    ",
-                page + 1, pages, pct, sent, total, etabuf);
+        fprintf(stderr, "\r[fax] page %d/%d  %3.0f%%  %zu/%zu B  %s %dbps  ETA %s    ",
+                page + 1, pages, pct, sent, total, modem, rate, etabuf);
     else
-        fprintf(stderr, "[fax] page %d/%d %.0f%% (%zu/%zu B) ETA %s\n",
-                page + 1, pages, pct, sent, total, etabuf);
+        fprintf(stderr, "[fax] page %d/%d %.0f%% (%zu/%zu B) %s %dbps ETA %s\n",
+                page + 1, pages, pct, sent, total, modem, rate, etabuf);
     fflush(stderr);
+}
+
+/* Pull one 20 ms tx block from the fax engine, zero-padding a short final
+ * block so the caller always transmits a full frame. Returns the real count. */
+static int fax_tx_block(nf_t30_t *fax, int16_t *out)
+{
+    int n = nf_t30_tx(fax, out, SAMPLES_PER_BLOCK);
+    if (n < SAMPLES_PER_BLOCK)
+        memset(out + n, 0, (size_t) (SAMPLES_PER_BLOCK - n) * 2);
+    return n;
+}
+
+/* Block until `deadline` for either fd to become readable. Returns select()'s
+ * result (>0 with the ready set in *rfds); <=0 means the tick is due or nothing
+ * arrived, and the caller's inner service loop should break to run the tick.
+ * This is the shared inner-loop plumbing of every select-based media pump. */
+static int media_wait(int fd_a, int fd_b, const struct timespec *deadline, fd_set *rfds)
+{
+    long w = ts_until_ms(deadline);
+    if (w <= 0) return 0;
+    FD_ZERO(rfds);
+    FD_SET(fd_a, rfds);
+    FD_SET(fd_b, rfds);
+    int maxfd = fd_a > fd_b ? fd_a : fd_b;
+    struct timeval tv = { w / 1000, (w % 1000) * 1000 };
+    return select(maxfd + 1, rfds, NULL, NULL, &tv);
 }
 
 static int run_fax(int fd, int sending, const char *file, const char *ident,
@@ -745,9 +936,7 @@ static int run_fax(int fd, int sending, const char *file, const char *ident,
 
     for (;;) {
         if (sending) tx_progress(fax, &next_prog, &pmode, verbose, 0);
-        int n = nf_t30_tx(fax, out, SAMPLES_PER_BLOCK);
-        if (n < SAMPLES_PER_BLOCK)
-            memset(out + n, 0, (size_t) (SAMPLES_PER_BLOCK - n) * 2);
+        fax_tx_block(fax, out);
 
         /* Any socket failure (clean EOF, or a reset at end-of-call) just
          * means the link is gone; switch to finalizing locally. After the
@@ -772,9 +961,11 @@ static int run_fax(int fd, int sending, const char *file, const char *ident,
     }
 
     if (sending) tx_progress(fax, &next_prog, &pmode, verbose, 1);
+    int rc = fax_result(&cs, eof);
+    debug_write_report(fax, sending, rc);
     nf_t30_free(fax);
 
-    return fax_result(&cs, eof);
+    return rc;
 }
 
 /* Offline debug: replay a captured inbound PCM stream (16-bit signed LE, 8 kHz
@@ -831,6 +1022,9 @@ static int run_fax_sip(sip_media_t *m, int sending, const char *file,
     int flush = 0;
     int ended = 0;
     int pmode = -1;
+    /* DEBUG (diagnostic only): dump inbound decoded PCM (16-bit LE 8 kHz mono)
+     * for offline signal analysis. Gated by NF_RX_AUDIO_DUMP=<path>. */
+    FILE *adump = getenv("NF_RX_AUDIO_DUMP") ? fopen(getenv("NF_RX_AUDIO_DUMP"), "wb") : NULL;
 
     struct timespec next_tick, next_prog;
     clock_gettime(CLOCK_MONOTONIC, &next_tick);
@@ -841,35 +1035,26 @@ static int run_fax_sip(sip_media_t *m, int sending, const char *file,
         if (sending) tx_progress(fax, &next_prog, &pmode, verbose, 0);
         /* Until the next 20 ms tick, service whichever socket is ready:
          * decode inbound RTP into the fax receiver, answer in-dialog SIP. */
-        for (;;) {
-            long w = ts_until_ms(&next_tick);
-            if (w <= 0) break;
-
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(m->rtp_sock, &rfds);
-            FD_SET(m->sip_sock, &rfds);
-            int maxfd = m->rtp_sock > m->sip_sock ? m->rtp_sock : m->sip_sock;
-            struct timeval tv = { w / 1000, (w % 1000) * 1000 };
-            if (select(maxfd + 1, &rfds, NULL, NULL, &tv) <= 0) break;
-
+        fd_set rfds;
+        while (media_wait(m->rtp_sock, m->sip_sock, &next_tick, &rfds) > 0) {
             if (FD_ISSET(m->rtp_sock, &rfds)) {
                 int n = sip_media_rx(m, in, SAMPLES_PER_BLOCK);
-                if (n > 0) nf_t30_rx(fax, in, n);
+                if (n > 0) {
+                    if (adump) fwrite(in, sizeof(int16_t), (size_t) n, adump);
+                    nf_t30_rx(fax, in, n);
+                }
             }
             if (FD_ISSET(m->sip_sock, &rfds)) {
                 if (sip_media_poll_sip(m)) ended = 1;
                 /* The peer re-INVITEd us to T.38 and we accepted: abandon the
                  * audio engine; the caller restarts the call over T.38. */
-                if (sip_media_is_t38(m)) { nf_t30_free(fax); return -2; }
+                if (sip_media_is_t38(m)) { if (adump) fclose(adump); nf_t30_free(fax); return -2; }
             }
         }
 
         /* Tick: pull one frame from the fax transmitter and send it as RTP. */
         ts_add_ms(&next_tick, 20);
-        int n = nf_t30_tx(fax, out, SAMPLES_PER_BLOCK);
-        if (n < SAMPLES_PER_BLOCK)
-            memset(out + n, 0, (size_t) (SAMPLES_PER_BLOCK - n) * 2);
+        fax_tx_block(fax, out);
         sip_media_tx(m, out, SAMPLES_PER_BLOCK);
 
         /* After local completion (Phase E) or a peer hang-up, run a bounded
@@ -878,9 +1063,17 @@ static int run_fax_sip(sip_media_t *m, int sending, const char *file,
     }
 
     if (sending) tx_progress(fax, &next_prog, &pmode, verbose, 1);
+    if (adump) fclose(adump);
+    {   /* Remember a failed V.34 attempt so the dialer can redial classic G3. */
+        nf_t30_stats_t st;
+        nf_t30_get_stats(fax, &st);
+        g_last_v34_failed = st.v34 && (!cs.done || cs.result != NF_T30_OK);
+    }
+    int rc = fax_result(&cs, ended);
+    debug_write_report(fax, sending, rc);
     nf_t30_free(fax);
 
-    return fax_result(&cs, ended);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -912,16 +1105,8 @@ static int run_fax_t38(sip_media_t *m, int sending, const char *file,
     for (;;) {
         if (sending) tx_progress(fax, &next_prog, &pmode, verbose, 0);
         /* Until the next 30 ms tick, drain inbound UDPTL and service SIP. */
-        for (;;) {
-            long w = ts_until_ms(&next_tick);
-            if (w <= 0) break;
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(m->t38_sock, &rfds);
-            FD_SET(m->sip_sock, &rfds);
-            int maxfd = m->t38_sock > m->sip_sock ? m->t38_sock : m->sip_sock;
-            struct timeval tv = { w / 1000, (w % 1000) * 1000 };
-            if (select(maxfd + 1, &rfds, NULL, NULL, &tv) <= 0) break;
+        fd_set rfds;
+        while (media_wait(m->t38_sock, m->sip_sock, &next_tick, &rfds) > 0) {
             if (FD_ISSET(m->t38_sock, &rfds)) {
                 uint8_t dg[2048];
                 int n = sip_t38_rx(m, dg, sizeof dg);
@@ -939,8 +1124,10 @@ static int run_fax_t38(sip_media_t *m, int sending, const char *file,
     }
 
     if (sending) tx_progress(fax, &next_prog, &pmode, verbose, 1);
+    int rc = fax_result(&cs, ended);
+    debug_write_report(fax, sending, rc);
     nf_t30_free(fax);
-    return fax_result(&cs, ended);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1011,6 +1198,37 @@ static int dctl_recv(int ctrl, struct dctl_msg *m, int *fd)
     return (int) r;
 }
 
+/* Daemon: write a <base>.meta sidecar next to <base>.tiff recording the fax
+ * metadata (remote station id, receive time, negotiated call params). */
+static void write_meta_sidecar(const char *tiff_path, nf_t30_t *fax)
+{
+    nf_t30_stats_t st;
+    nf_t30_get_stats(fax, &st);
+    if (st.pages_rx < 1) return;          /* nothing received: no sidecar */
+
+    char meta[512];
+    size_t L = strlen(tiff_path);
+    if (L > 5 && strcmp(tiff_path + L - 5, ".tiff") == 0)
+        snprintf(meta, sizeof meta, "%.*s.meta", (int) (L - 5), tiff_path);
+    else
+        snprintf(meta, sizeof meta, "%s.meta", tiff_path);
+
+    FILE *f = fopen(meta, "w");
+    if (!f) { perror("spool .meta"); return; }
+    char iso[40] = "";
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    if (tm) strftime(iso, sizeof iso, "%Y-%m-%dT%H:%M:%S", tm);
+    fprintf(f, "remote_id=%s\n", st.rx_ident);
+    fprintf(f, "received=%s\n", iso);
+    fprintf(f, "pages=%d\n", st.pages_rx);
+    fprintf(f, "resolution=%dx%d\n", st.x_resolution, st.y_resolution);
+    fprintf(f, "bit_rate=%d\n", st.bit_rate);
+    fprintf(f, "mode=%s\n", st.v34 ? "Super-G3/V.34" : "G3");
+    fprintf(f, "ecm=%s\n", st.ecm ? "on" : "off");
+    fclose(f);
+}
+
 /* Child-side T.38 media loop after a mid-call switchover: pump the UDPTL socket
  * (already installed in m->t38_sock) against a fresh receiving fax engine. The
  * far end re-runs T.30 Phase B over T.38. Ends on completion or a parent stop. */
@@ -1032,16 +1250,8 @@ static int run_fax_t38_child(sip_media_t *m, int ctrl_fd, const char *tiff_path,
     ts_add_ms(&next_tick, 30);
 
     for (;;) {
-        for (;;) {
-            long w = ts_until_ms(&next_tick);
-            if (w <= 0) break;
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(m->t38_sock, &rfds);
-            FD_SET(ctrl_fd, &rfds);
-            int maxfd = m->t38_sock > ctrl_fd ? m->t38_sock : ctrl_fd;
-            struct timeval tv = { w / 1000, (w % 1000) * 1000 };
-            if (select(maxfd + 1, &rfds, NULL, NULL, &tv) <= 0) break;
+        fd_set rfds;
+        while (media_wait(m->t38_sock, ctrl_fd, &next_tick, &rfds) > 0) {
             if (FD_ISSET(m->t38_sock, &rfds)) {
                 uint8_t dg[2048];
                 int n = sip_t38_rx(m, dg, sizeof dg);
@@ -1060,6 +1270,7 @@ static int run_fax_t38_child(sip_media_t *m, int ctrl_fd, const char *tiff_path,
     }
 
     if (m->t38_sock >= 0) close(m->t38_sock);
+    write_meta_sidecar(tiff_path, fax);
     nf_t30_free(fax);
     return fax_result(&cs, ended);
 }
@@ -1131,18 +1342,8 @@ static int run_fax_media(sip_media_t *m, int stop_fd, const char *tiff_path,
     ts_add_ms(&next_tick, 20);
 
     for (;;) {
-        for (;;) {
-            long w = ts_until_ms(&next_tick);
-            if (w <= 0) break;
-
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(m->rtp_sock, &rfds);
-            FD_SET(stop_fd, &rfds);
-            int maxfd = m->rtp_sock > stop_fd ? m->rtp_sock : stop_fd;
-            struct timeval tv = { w / 1000, (w % 1000) * 1000 };
-            if (select(maxfd + 1, &rfds, NULL, NULL, &tv) <= 0) break;
-
+        fd_set rfds;
+        while (media_wait(m->rtp_sock, stop_fd, &next_tick, &rfds) > 0) {
             if (FD_ISSET(m->rtp_sock, &rfds)) {
                 int n = sip_media_rx(m, in, SAMPLES_PER_BLOCK);
                 if (n > 0) {
@@ -1170,15 +1371,14 @@ static int run_fax_media(sip_media_t *m, int stop_fd, const char *tiff_path,
         }
 
         ts_add_ms(&next_tick, 20);
-        int n = nf_t30_tx(fax, out, SAMPLES_PER_BLOCK);
-        if (n < SAMPLES_PER_BLOCK)
-            memset(out + n, 0, (size_t) (SAMPLES_PER_BLOCK - n) * 2);
+        fax_tx_block(fax, out);
         sip_media_tx(m, out, SAMPLES_PER_BLOCK);
 
         if ((cs.done || ended) && ++flush > FLUSH_BLOCKS) break;
     }
 
     if (adump) fclose(adump);
+    write_meta_sidecar(tiff_path, fax);
     nf_t30_free(fax);                 /* flushes + closes the multi-page TIFF */
     return fax_result(&cs, ended);
 }
@@ -1345,6 +1545,14 @@ static void daemon_dispatch(struct dcall *calls, sip_media_t *listen,
 
     if (strcasecmp(method, "INVITE") == 0) {
         if (!c) { daemon_accept(calls, listen, cfg, buf, from); return; }
+        /* In-dialog re-INVITE (Call-ID already matched): require it to come
+         * from the call's peer, else a guessed Call-ID could redirect media. */
+        if (from->sin_addr.s_addr != c->call.sip_peer.sin_addr.s_addr) {
+            if (cfg->verbose)
+                fprintf(stderr, "[%s] ignoring off-dialog re-INVITE (source mismatch)\n",
+                        c->call_id);
+            return;
+        }
         /* Same Call-ID: a retransmitted initial INVITE, a retransmitted T.38
          * re-INVITE, or a fresh re-INVITE (T.38 switchover), told apart by CSeq. */
         char cseq[64] = ""; sip_hdr(buf, "CSeq", cseq, sizeof(cseq));
@@ -1376,6 +1584,15 @@ static void daemon_dispatch(struct dcall *calls, sip_media_t *listen,
     }
 
     if (!c) return;   /* ACK/BYE/etc. for an unknown dialog: ignore */
+
+    /* In-dialog request with a matching Call-ID must also come from the call's
+     * peer; otherwise a guessed Call-ID would let any host end the call. */
+    if (from->sin_addr.s_addr != c->call.sip_peer.sin_addr.s_addr) {
+        if (cfg->verbose)
+            fprintf(stderr, "[%s] ignoring off-dialog %s (source mismatch)\n",
+                    c->call_id, method);
+        return;
+    }
 
     if (strcasecmp(method, "BYE") == 0 || strcasecmp(method, "CANCEL") == 0) {
         sip_dialog_respond(&c->call, buf, "200 OK", from);
@@ -1529,9 +1746,33 @@ static void usage(const char *argv0)
         "                        Needs --user (and usually --password); receive-only.\n"
         "  --reg-interval <sec>  daemon re-REGISTER cadence (default 60; Expires=2x)\n"
         "\n"
-        "  --ident <str>         local fax identifier (default \"sip_fax\")\n"
+        "  --ident <str>         local station identifier (max 20 chars) sent as\n"
+        "                        TSI/CSI/CIG in T.30 phase B and shown to the peer;\n"
+        "                        the remote's id is logged and stored in the received\n"
+        "                        TIFF/daemon .meta. Default \"sip_fax\"; \"\" sends none.\n"
         "  --no-ecm              disable T.30 Error Correction Mode (ECM on by default)\n"
-        "  --verbose             enable T.30 protocol logging (and SIP traffic)\n",
+        "  --v34 / --no-v34      offer / suppress V.34 (Super G3) in V.8 negotiation.\n"
+        "                        On by default (like a real SG3 machine): used when\n"
+        "                        both peers support it, otherwise V.8 falls back to\n"
+        "                        the best common G3 modem (V.17/V.29/V.27), or to the\n"
+        "                        classic CNG/CED->DIS flow for a non-V.8 peer.\n"
+        "                        (Polling always uses classic G3.)\n"
+        "  --require-v34         fail the call (DCN, exit 1) BEFORE sending any page\n"
+        "                        data if V.8 does not negotiate V.34 (Super G3),\n"
+        "                        instead of falling back to classic G3. Implies --v34.\n"
+        "  --no-redial           don't redial as classic G3 after a dialed V.34\n"
+        "                        call fails (default: one automatic redial with\n"
+        "                        V.34 suppressed - some SG3 machines advertise\n"
+        "                        capabilities their V.34 stack cannot receive)\n"
+        "  --verbose             enable T.30 protocol logging (and SIP traffic)\n"
+        "  --debug [--debug-dir D]\n"
+        "                        full diagnostic capture for analysing failures:\n"
+        "                        implies --verbose, logs whole SIP messages and\n"
+        "                        lower-layer (T.30/V.34/T.38) traces with wall-clock\n"
+        "                        timestamps, saves inbound audio (rx.pcm) and a\n"
+        "                        session.log + report.txt under a debug directory\n"
+        "                        (auto-named, or --debug-dir D). Replay the audio\n"
+        "                        offline with --replay-rx D/rx.pcm --receive out.tiff\n",
         argv0, FAX_LINE_WIDTH);
 }
 
@@ -1573,6 +1814,8 @@ int main(int argc, char **argv)
     int reg_interval = 60;               /* --reg-interval <sec> */
     int enable_t38 = 0;                  /* --t38 (offer/accept T.38) */
     const char *replay_rx = NULL;        /* --replay-rx <pcm> (offline debug) */
+    int debug = 0;                       /* --debug: capture everything        */
+    const char *debug_dir = NULL;        /* --debug-dir <dir>                  */
 
     signal(SIGPIPE, SIG_IGN);   /* writing to a closed link returns EPIPE, not a fatal signal */
 
@@ -1610,6 +1853,12 @@ int main(int argc, char **argv)
         { "no-t38",     no_argument,       0, 1008 },
         { "ident",      required_argument, 0, 'i' },
         { "no-ecm",     no_argument,       0, 'E' },
+        { "v34",        no_argument,       0, 1009 },
+        { "no-v34",     no_argument,       0, 1010 },
+        { "require-v34",no_argument,       0, 1011 },
+        { "no-redial",  no_argument,       0, 1012 },
+        { "debug",      no_argument,       0, 1013 },
+        { "debug-dir",  required_argument, 0, 1014 },
         { "verbose",    no_argument,       0, 'v' },
         { "help",       no_argument,       0, 'h' },
         { 0, 0, 0, 0 }
@@ -1670,10 +1919,24 @@ int main(int argc, char **argv)
         case 1002: g_poll_serve = 1; break;
         case 1003: g_poll_recv = 1; break;
         case 'E': g_use_ecm = 0; break;
+        case 1009: g_v34 = 1; break;
+        case 1010: g_v34 = 0; break;
+        case 1011: g_require_v34 = 1; break;
+        case 1012: g_auto_redial = 0; break;
+        case 1013: debug = 1; break;
+        case 1014: debug = 1; debug_dir = optarg; break;
         case 'v': verbose = 1; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 2;
         }
+    }
+
+    /* --debug: one switch that turns on full protocol logging, captures the
+     * inbound audio, and tees the whole trace to <dir>/session.log. Do this
+     * before any transport starts so nothing is missed. */
+    if (debug) {
+        verbose = 1;
+        setup_debug(debug_dir);
     }
 
     /* Offline debug: replay a captured PCM stream through the receiver. */
@@ -1771,6 +2034,10 @@ int main(int argc, char **argv)
     }
     if (altdoc.require_color && !send_color) {
         fprintf(stderr, "error: --require-color needs --send-color\n");
+        return 2;
+    }
+    if (g_require_v34 && !g_v34) {
+        fprintf(stderr, "error: --require-v34 conflicts with --no-v34\n");
         return 2;
     }
 
@@ -1905,20 +2172,35 @@ int main(int argc, char **argv)
     int rc;
 
     if (use_sip) {
-        sip_media_t media;
-        if (sip_media_establish(&scfg, &media) != 0) {
-            if (made_tmp) unlink(tmp_tiff);
-            return 1;
-        }
-        if (scfg.enable_t38 && scfg.dial && sip_offer_t38(&media, &scfg)) {
-            /* Dialer: offered T.38 via re-INVITE and the peer accepted. */
-            rc = run_fax_t38(&media, sending, fax_file, ident, verbose, doc);
-        } else {
-            rc = run_fax_sip(&media, sending, fax_file, ident, verbose, doc);
-            if (rc == -2)        /* answerer accepted a T.38 re-INVITE mid-call */
+        for (;;) {
+            sip_media_t media;
+            if (sip_media_establish(&scfg, &media) != 0) {
+                if (made_tmp) unlink(tmp_tiff);
+                return 1;
+            }
+            if (scfg.enable_t38 && scfg.dial && sip_offer_t38(&media, &scfg)) {
+                /* Dialer: offered T.38 via re-INVITE and the peer accepted. */
                 rc = run_fax_t38(&media, sending, fax_file, ident, verbose, doc);
+            } else {
+                rc = run_fax_sip(&media, sending, fax_file, ident, verbose, doc);
+                if (rc == -2)    /* answerer accepted a T.38 re-INVITE mid-call */
+                    rc = run_fax_t38(&media, sending, fax_file, ident, verbose, doc);
+            }
+            sip_media_hangup(&media);
+            /* A dialed call that negotiated V.34 but failed gets one redial as
+             * classic G3: some SG3 machines advertise capabilities their V.34
+             * stack cannot actually receive (seen in the field with JPEG). */
+            if (rc != 0 && g_last_v34_failed && g_auto_redial && scfg.dial &&
+                g_v34 && !g_require_v34) {
+                fprintf(stderr, "V.34 call failed; redialing without V.34 "
+                        "(classic G3)...\n");
+                g_v34 = 0;
+                g_last_v34_failed = 0;
+                if (doc) { doc->chosen = -1; doc->chosen_kind = NULL; }
+                continue;
+            }
+            break;
         }
-        sip_media_hangup(&media);
     } else {
         /* TCP transport. */
         int fd;

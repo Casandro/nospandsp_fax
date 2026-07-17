@@ -363,20 +363,15 @@ static int read_run(nf_t4_dec_t *d, int black)
     return total;
 }
 
+static int consume_eol_tag(nf_t4_dec_t *d, int *tag_1d);
+
 /* Consume a 1-D EOL (>=11 zero bits then a 1) if present at the cursor.
  * Returns 1 if an EOL was consumed, 0 otherwise. Leaves the cursor unchanged
  * when no EOL is present. */
 static int consume_eol(nf_t4_dec_t *d)
 {
-    size_t save = d->bitpos;
-    int zeros = 0, b;
-    while ((b = get_bit(d)) == 0) zeros++;
-    if (b == 1 && zeros >= 11) {
-        if (d->comp == NF_T4_COMPRESSION_2D) get_bit(d);   /* tag bit */
-        return 1;
-    }
-    d->bitpos = save;
-    return 0;
+    int tag = 0;                            /* tag bit consumed but not needed */
+    return consume_eol_tag(d, &tag);
 }
 
 /* Like consume_eol but reports the tag bit (1 => next row 1-D) for T.4-2D. */
@@ -523,9 +518,7 @@ int nf_t4_dec_put(nf_t4_dec_t *d, const uint8_t *data, size_t len)
         while (consume_eol_tag(d, &tag_1d)) { consecutive++; got = 1; if (consecutive >= 6) { d->ended = 1; break; } }
         if (d->ended) break;
         if (bits_left(d) < 8) { d->ended = 1; break; }
-        if (!got && d->rows == 0) {
-            /* No leading EOL? Tolerate, treat first row as 1-D. */
-        }
+        /* No leading EOL? Tolerate it: the first row is treated as 1-D below. */
         int row_1d = (d->comp == NF_T4_COMPRESSION_1D) || tag_1d || (d->rows == 0 && !got);
         int rc = row_1d ? decode_1d_row(d) : decode_2d_row(d);
         if (rc < 0) {

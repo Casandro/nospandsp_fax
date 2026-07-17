@@ -43,7 +43,8 @@ static int check_codestream(const uint8_t *d, size_t n)
             if (nc != 3) { printf("  SOF components=%d (want 3)\n", nc); return -1; }
             for (int c = 0; c < nc; c++) {
                 uint8_t sf = d[pl + 6 + c*3 + 1];      /* H<<4 | V */
-                if (sf != 0x11) { printf("  comp %d sampling=0x%02x (want 0x11)\n", c, sf); return -1; }
+                uint8_t want = c == 0 ? 0x22 : 0x11;   /* T.42 default 4:1:1 */
+                if (sf != want) { printf("  comp %d sampling=0x%02x (want 0x%02x)\n", c, sf, want); return -1; }
             }
         }
         if (m == 0xDA) break;                 /* SOS: scan data follows */

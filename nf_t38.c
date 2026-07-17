@@ -51,6 +51,14 @@ enum {
     TX_TONE_WAIT, TX_PAUSE_WAIT, TX_COMPLETE
 };
 
+/* ITU-T T.38 §9: indicators are not covered by the UDPTL redundancy that
+ * protects data fields, so each is sent several times to survive packet loss and
+ * be seen by a peer whose receiver just came up (e.g. right after the T.38
+ * switchover). Only the low-speed tone/preamble indicators are repeated; a fast
+ * carrier's training indicator maps to CARRIER_UP/TRAINING_SUCCEEDED in nf_t30,
+ * which must fire exactly once, so those stay single. */
+#define T38_IND_REPEAT 3
+
 /* Delay (ms) to allow after an indicator before sending data, so a T.38 gateway
  * can play out the modem training / HDLC flag preamble to a real fax machine.
  * Values approximate the T.38 modem startup times. */
@@ -82,6 +90,7 @@ struct nf_t38 {
     int  tx_phase;
     int  tx_next_phase;     /* phase to enter after the post-indicator wait */
     int  tx_ind;            /* indicator to emit for the current burst   */
+    int  tx_ind_left;       /* extra repeats of the current indicator     */
     int  tx_dt;             /* data type for the current burst           */
     int  tx_bit_rate;       /* for pacing non-ECM data                   */
     int  tx_is_hdlc;        /* current carrier carries HDLC              */
@@ -249,6 +258,10 @@ static void t38_set_tx_type(void *be, int type, int rate, int short_train, int u
         s->tx_phase = TX_IND;           /* emit training/preamble, then data */
         break;
     }
+
+    /* Repeat only the low-speed tone/preamble indicators (see T38_IND_REPEAT). */
+    s->tx_ind_left = (s->tx_phase == TX_IND && s->tx_ind <= IND_V21_PREAMBLE)
+                   ? (T38_IND_REPEAT - 1) : 0;
 }
 
 static void t38_set_rx_type(void *be, int type, int rate, int short_train, int use_hdlc)
@@ -319,6 +332,7 @@ void nf_t38_pump(nf_t38_t *s, int ms)
 
     case TX_IND:
         emit_indicator(s, s->tx_ind);
+        if (s->tx_ind_left > 0) { s->tx_ind_left--; break; }  /* T.38 §9: repeat, then proceed */
         if (s->tx_is_hdlc == -1) {           /* NO_SIGNAL: nothing follows */
             s->tx_phase = TX_IDLE;
         } else if (s->tx_is_hdlc == -2) {    /* CED/CNG tone */
@@ -564,13 +578,17 @@ static void rx_ifp(nf_t38_t *s, const uint8_t *buf, int len)
 /* UDPTL -> IFP fan-out (recovered gap-fillers + primary, in order). */
 static void on_udptl_ifp(void *user, const uint8_t *ifp, int ifp_len, int seq)
 {
-    (void) seq;
+    if (t38dbg())
+        fprintf(stderr, "[T38 IFP] seq=%d len=%d b0=0x%02x\n",
+                seq, ifp_len, ifp_len > 0 ? ifp[0] : 0);
     rx_ifp((nf_t38_t *) user, ifp, ifp_len);
 }
 
 void nf_t38_rx_datagram(nf_t38_t *s, const uint8_t *dgram, int len)
 {
-    nf_udptl_rx(&s->udptl, dgram, len, on_udptl_ifp, s);
+    int rc = nf_udptl_rx(&s->udptl, dgram, len, on_udptl_ifp, s);
+    if (rc < 0 && t38dbg())
+        fprintf(stderr, "[T38 IFP] UDPTL decode failed (%d bytes dropped)\n", len);
 }
 
 /* ── construction ────────────────────────────────────────────────────────── */

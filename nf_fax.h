@@ -23,6 +23,13 @@ enum {
     NF_MODEM_V27TER,       /* 2400/4800                                       */
     NF_MODEM_V29,          /* 7200/9600                                       */
     NF_MODEM_V17,          /* 7200..14400                                     */
+    NF_MODEM_V8,           /* T.30 Annex F handshake: ANSam/CM/JM/CJ           */
+    NF_MODEM_V34,          /* V.34 half-duplex (T.30 Annex F "Super G3").
+                            * bit_rate selects the sub-mode: 0 = clause-12
+                            * startup (Phases 2-3 + control-channel
+                            * handshake), 1200 = control channel (HDLC
+                            * control frames), 24000 = primary channel
+                            * (ECM image HDLC stream).                       */
     NF_MODEM_DONE          /* call finished                                   */
 };
 
@@ -71,6 +78,21 @@ void nf_fax_send_hdlc(nf_fax_t *s, const uint8_t *msg, int len);
 void nf_fax_begin_hdlc_stream(nf_fax_t *s);
 
 void nf_fax_set_transmit_on_idle(nf_fax_t *s, int on);
+
+/* T.30 Annex F: the capability set (NF_V8_MOD_* mask) and call-function
+ * (NF_V8_CALL_*) offered in our CM/JM, set once before selecting
+ * NF_MODEM_V8 as the tx type (which is what actually arms the handshake -
+ * see nf_fax_set_tx_type()). The negotiated result (available once
+ * NF_STATUS_TRAINING_SUCCEEDED/FAILED is reported while NF_MODEM_V8 is
+ * active) is read back with the two accessors below. */
+void     nf_fax_set_v8_caps(nf_fax_t *s, uint32_t modulations, int32_t call_function);
+uint32_t nf_fax_v8_modulations(const nf_fax_t *s);
+
+/* Currently negotiated V.34 primary-channel data rate (bit/s; 12.4.1.3
+ * result of the most recent MPh exchange, including automatic fallback
+ * renegotiations). 0 when no V.34 session exists / before the first MPh. */
+int nf_fax_v34_bit_rate(const nf_fax_t *s);
+int32_t  nf_fax_v8_call_function(const nf_fax_t *s);
 
 /* Sample pump. nf_fax_tx fills up to max_len samples (returns count);
  * nf_fax_rx consumes len samples. */

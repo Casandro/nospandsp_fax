@@ -35,6 +35,9 @@ typedef struct {
     int bit_rate;
     int width, length;             /* most recent page, pixels */
     int x_resolution, y_resolution;/* dpi */
+    int v34;                       /* 1 if this call ran over V.34 (Super G3) */
+    int ecm;                       /* 1 if the transfer used ECM */
+    char rx_ident[24];             /* remote station id from TSI/CSI/CIG ("" if none) */
 } nf_t30_stats_t;
 
 typedef struct nf_t30 nf_t30_t;
@@ -57,6 +60,19 @@ void nf_t30_set_log_tag(nf_t30_t *s, const char *tag);
 /* Error Correction Mode (T.30 Annex A). On by default; used only when the far
  * end also advertises ECM, otherwise the call falls back to non-ECM. */
 void nf_t30_set_ecm(nf_t30_t *s, int on);
+
+/* ── V.34 fax (T.30 Annex F "Super G3") ──
+ * Off by default (the classic V.21+V.17 path is untouched). When enabled on
+ * the audio backend, V.34 half-duplex is offered in the V.8 CM/JM
+ * modulation set; if both ends negotiate it, the session runs Annex F: all
+ * T.30 frames over the V.34 control channel (no TCF - CFR straight after
+ * DCS, DCS speed bits 0), the page as ECM frames over the 24000 bit/s
+ * primary channel. ECM is implied. Also enabled by env NF_T30_V34=1. */
+void nf_t30_set_v34(nf_t30_t *s, int on);
+/* Abort the call (send DCN, fail) before transmitting any page data if V.8 did
+ * not negotiate V.34 (Super G3). Use to fail fast instead of falling back to
+ * classic G3. Only meaningful on the sending side. */
+void nf_t30_set_require_v34(nf_t30_t *s, int on);
 
 /* ── Colour fax (T.30 Annex E / T.42 / T.81 JPEG) ──
  * Colour requires ECM and is negotiated only when both ends support it. */
@@ -103,6 +119,10 @@ const char *nf_t30_completion_to_str(int result);
  * Any output pointer may be NULL. */
 int  nf_t30_tx_progress(nf_t30_t *s, int *page, int *pages,
                         size_t *sent, size_t *total, int *bit_rate);
+
+/* Name of the image modem selected for the current page ("V.17"/"V.29"/
+ * "V.27ter"/"V.34"), for progress display. */
+const char *nf_t30_modem_name(const nf_t30_t *s);
 
 /* Sample pump (forwarded to the driver). Audio backend only. */
 int  nf_t30_tx(nf_t30_t *s, int16_t *amp, int max_len);

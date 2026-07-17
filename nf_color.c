@@ -11,7 +11,7 @@
  * sRGB <-> CIELAB(D50) <-> 8-bit T.42 components, plus T.81 baseline JPEG via
  * libjpeg. See nf_color.h. The JPEG is driven in JCS_UNKNOWN (opaque) mode so
  * libjpeg never applies an RGB<->YCbCr transform to our L*a*b* samples, and with
- * 1:1:1 sampling (no chroma subsampling).
+ * the T.42 default 4:1:1 sampling (chroma at half resolution both ways).
  */
 
 /* ── colour space: sRGB <-> CIELAB (D50) ───────────────────────────── */
@@ -105,6 +105,111 @@ static void nf_jpeg_error_exit(j_common_ptr ci)
 /* T.42-style identifying marker (we use the default D50 illuminant / gamut). */
 static const uint8_t G3FAX_MARKER[] = { 'G','3','F','A','X', 0x00, 0x01 };
 
+/* Reject wildly out-of-range JPEG dimensions before allocating from them.
+ * libjpeg permits up to 65500x65500; a real fax page is a few thousand
+ * pixels each way. Without this, a tiny hostile JPEG forces a multi-gigabyte
+ * allocation (DoS), and on a 32-bit build (size_t)W*H*comps overflows into an
+ * undersized buffer that the scanline loop then writes past (heap overflow).
+ * The per-dimension cap keeps W*H*comps well inside size_t on all platforms. */
+#define NF_JPEG_MAX_DIM     10000
+#define NF_JPEG_MAX_PIXELS  (64 * 1024 * 1024)   /* ~64 Mpx: covers A3 @ 400 dpi */
+
+static int jpeg_dims_ok(int w, int h)
+{
+    if (w <= 0 || h <= 0) return 0;
+    if (w > NF_JPEG_MAX_DIM || h > NF_JPEG_MAX_DIM) return 0;
+    if ((int64_t) w * h > NF_JPEG_MAX_PIXELS) return 0;
+    return 1;
+}
+
+/* Compress `comps`-component `samples` (row stride w*comps) to a JPEG in a
+ * freshly malloc'd buffer returned via out/out_len. `cs` is the colour space;
+ * chroma_411 requests T.42 4:1:1 sub-sampling on the first component. The
+ * caller owns `samples` and frees it regardless of the return. 0 ok, -1 fail. */
+static int jpeg_compress(const uint8_t *samples, int w, int h, int comps,
+                         J_COLOR_SPACE cs, int chroma_411, int quality,
+                         uint8_t **out, size_t *out_len)
+{
+    struct jpeg_compress_struct cinfo;
+    struct nf_jerr jerr;
+    unsigned char *mem = NULL;
+    unsigned long memlen = 0;
+
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = nf_jpeg_error_exit;
+    if (setjmp(jerr.jb)) { jpeg_destroy_compress(&cinfo); free(mem); return -1; }
+    jpeg_create_compress(&cinfo);
+    jpeg_mem_dest(&cinfo, &mem, &memlen);
+    cinfo.image_width = (JDIMENSION) w;
+    cinfo.image_height = (JDIMENSION) h;
+    cinfo.input_components = comps;
+    cinfo.in_color_space = cs;
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_colorspace(&cinfo, cs);           /* no JFIF/Adobe markers */
+    if (chroma_411) {
+        /* T.42 default sub-sampling is 4:1:1 (chroma at half resolution both
+         * ways); 1:1:1 is only allowed when the receiver advertises DIS bit 73,
+         * so the default is the one mode every colour receiver must accept. */
+        cinfo.comp_info[0].h_samp_factor = 2;
+        cinfo.comp_info[0].v_samp_factor = 2;
+        for (int c = 1; c < comps; c++) {
+            cinfo.comp_info[c].h_samp_factor = 1;
+            cinfo.comp_info[c].v_samp_factor = 1;
+        }
+    }
+    jpeg_set_quality(&cinfo, quality, TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+    jpeg_write_marker(&cinfo, JPEG_APP0 + 1, G3FAX_MARKER, sizeof G3FAX_MARKER);
+    while (cinfo.next_scanline < cinfo.image_height) {
+        JSAMPROW row = (JSAMPROW) (samples + (size_t) cinfo.next_scanline * w * comps);
+        jpeg_write_scanlines(&cinfo, &row, 1);
+    }
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+    *out = mem;
+    *out_len = (size_t) memlen;
+    return 0;
+}
+
+/* Decompress a JPEG to a freshly malloc'd `want_comps`-component planar buffer
+ * (*planar, row stride W*want_comps) with the given output colour space. When
+ * out_cs is JCS_UNKNOWN the stored components are treated as opaque (identity
+ * transform - our L*a*b* streams). Rejects implausible dimensions and any
+ * component count != want_comps. 0 ok, -1 fail. */
+static int jpeg_decompress(const uint8_t *bytes, size_t len, int want_comps,
+                           J_COLOR_SPACE out_cs, uint8_t **planar, int *w, int *h)
+{
+    struct jpeg_decompress_struct dinfo;
+    struct nf_jerr jerr;
+    uint8_t *buf = NULL;
+
+    dinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = nf_jpeg_error_exit;
+    if (setjmp(jerr.jb)) { jpeg_destroy_decompress(&dinfo); free(buf); return -1; }
+    jpeg_create_decompress(&dinfo);
+    jpeg_mem_src(&dinfo, bytes, (unsigned long) len);
+    jpeg_save_markers(&dinfo, JPEG_APP0 + 1, 0xFFFF);   /* keep G3FAX if present */
+    if (jpeg_read_header(&dinfo, TRUE) != JPEG_HEADER_OK) longjmp(jerr.jb, 1);
+    /* A stream with no JFIF/Adobe marker is assumed YCbCr by libjpeg; for our
+     * opaque streams tell it the components are already final (no transform). */
+    if (out_cs == JCS_UNKNOWN) dinfo.jpeg_color_space = JCS_UNKNOWN;
+    dinfo.out_color_space = out_cs;
+    jpeg_start_decompress(&dinfo);
+    int W = (int) dinfo.output_width, H = (int) dinfo.output_height;
+    if (dinfo.output_components != want_comps) longjmp(jerr.jb, 1);
+    if (!jpeg_dims_ok(W, H)) longjmp(jerr.jb, 1);
+    buf = malloc((size_t) W * H * want_comps);
+    if (!buf) longjmp(jerr.jb, 1);
+    while (dinfo.output_scanline < dinfo.output_height) {
+        JSAMPROW row = (JSAMPROW) (buf + (size_t) dinfo.output_scanline * W * want_comps);
+        jpeg_read_scanlines(&dinfo, &row, 1);
+    }
+    jpeg_finish_decompress(&dinfo);
+    jpeg_destroy_decompress(&dinfo);
+    *planar = buf; *w = W; *h = H;
+    return 0;
+}
+
 /* ── encode ────────────────────────────────────────────────────────── */
 
 int nf_color_encode(const uint8_t *rgb, int w, int h, int quality,
@@ -114,52 +219,15 @@ int nf_color_encode(const uint8_t *rgb, int w, int h, int quality,
     if (quality < 1) quality = 1;
     if (quality > 100) quality = 100;
 
-    /* sRGB -> L*a*b* (same packed layout) */
+    /* sRGB -> L*a*b* (same packed layout), then a 3-component opaque JPEG. */
     uint8_t *lab = malloc((size_t) w * h * 3);
     if (!lab) return -1;
     for (size_t i = 0; i < (size_t) w * h; i++)
         srgb_to_lab8(rgb + i * 3, lab + i * 3);
 
-    struct jpeg_compress_struct cinfo;
-    struct nf_jerr jerr;
-    unsigned char *mem = NULL;
-    unsigned long memlen = 0;
-
-    cinfo.err = jpeg_std_error(&jerr.pub);
-    jerr.pub.error_exit = nf_jpeg_error_exit;
-    if (setjmp(jerr.jb)) {
-        jpeg_destroy_compress(&cinfo);
-        free(lab);
-        free(mem);
-        return -1;
-    }
-    jpeg_create_compress(&cinfo);
-    jpeg_mem_dest(&cinfo, &mem, &memlen);
-    cinfo.image_width = (JDIMENSION) w;
-    cinfo.image_height = (JDIMENSION) h;
-    cinfo.input_components = 3;
-    cinfo.in_color_space = JCS_UNKNOWN;        /* opaque: no colour transform */
-    jpeg_set_defaults(&cinfo);
-    jpeg_set_colorspace(&cinfo, JCS_UNKNOWN);  /* no JFIF/Adobe markers */
-    for (int c = 0; c < 3; c++) {
-        cinfo.comp_info[c].h_samp_factor = 1;  /* 1:1:1, no subsampling */
-        cinfo.comp_info[c].v_samp_factor = 1;
-    }
-    jpeg_set_quality(&cinfo, quality, TRUE);
-    jpeg_start_compress(&cinfo, TRUE);
-    jpeg_write_marker(&cinfo, JPEG_APP0 + 1, G3FAX_MARKER, sizeof G3FAX_MARKER);
-    while (cinfo.next_scanline < cinfo.image_height) {
-        JSAMPROW row = (JSAMPROW) (lab + (size_t) cinfo.next_scanline * w * 3);
-        jpeg_write_scanlines(&cinfo, &row, 1);
-    }
-    jpeg_finish_compress(&cinfo);
-    jpeg_destroy_compress(&cinfo);
+    int rc = jpeg_compress(lab, w, h, 3, JCS_UNKNOWN, 1, quality, out, out_len);
     free(lab);
-
-    /* mem was malloc'd by jpeg_mem_dest; hand it to the caller. */
-    *out = mem;
-    *out_len = (size_t) memlen;
-    return 0;
+    return rc;
 }
 
 /* ── decode ────────────────────────────────────────────────────────── */
@@ -169,38 +237,10 @@ int nf_color_decode(const uint8_t *bytes, size_t len,
 {
     if (!bytes || len == 0 || !rgb || !w || !h) return -1;
 
-    struct jpeg_decompress_struct dinfo;
-    struct nf_jerr jerr;
-    uint8_t *lab = NULL;
+    uint8_t *lab; int W, H;
+    if (jpeg_decompress(bytes, len, 3, JCS_UNKNOWN, &lab, &W, &H) != 0) return -1;
 
-    dinfo.err = jpeg_std_error(&jerr.pub);
-    jerr.pub.error_exit = nf_jpeg_error_exit;
-    if (setjmp(jerr.jb)) {
-        jpeg_destroy_decompress(&dinfo);
-        free(lab);
-        return -1;
-    }
-    jpeg_create_decompress(&dinfo);
-    jpeg_mem_src(&dinfo, bytes, (unsigned long) len);
-    jpeg_save_markers(&dinfo, JPEG_APP0 + 1, 0xFFFF);   /* keep G3FAX if present */
-    if (jpeg_read_header(&dinfo, TRUE) != JPEG_HEADER_OK) { longjmp(jerr.jb, 1); }
-    /* A 3-component stream with no JFIF/Adobe marker is assumed YCbCr by libjpeg;
-     * tell it the stored components are opaque so it does an identity transform. */
-    dinfo.jpeg_color_space = JCS_UNKNOWN;
-    dinfo.out_color_space = JCS_UNKNOWN;                /* opaque, 3 components */
-    jpeg_start_decompress(&dinfo);
-    int W = (int) dinfo.output_width, H = (int) dinfo.output_height;
-    if (dinfo.output_components != 3) { longjmp(jerr.jb, 1); }
-    lab = malloc((size_t) W * H * 3);
-    if (!lab) { longjmp(jerr.jb, 1); }
-    while (dinfo.output_scanline < dinfo.output_height) {
-        JSAMPROW row = (JSAMPROW) (lab + (size_t) dinfo.output_scanline * W * 3);
-        jpeg_read_scanlines(&dinfo, &row, 1);
-    }
-    jpeg_finish_decompress(&dinfo);
-    jpeg_destroy_decompress(&dinfo);
-
-    /* L*a*b* -> sRGB (in place reuse: write to a fresh rgb buffer) */
+    /* L*a*b* -> sRGB into a fresh buffer */
     uint8_t *out = malloc((size_t) W * H * 3);
     if (!out) { free(lab); return -1; }
     for (size_t i = 0; i < (size_t) W * H; i++)
@@ -227,35 +267,9 @@ int nf_gray_encode(const uint8_t *rgb, int w, int h, int quality,
         lum[i] = lab[0];
     }
 
-    struct jpeg_compress_struct cinfo;
-    struct nf_jerr jerr;
-    unsigned char *mem = NULL;
-    unsigned long memlen = 0;
-
-    cinfo.err = jpeg_std_error(&jerr.pub);
-    jerr.pub.error_exit = nf_jpeg_error_exit;
-    if (setjmp(jerr.jb)) { jpeg_destroy_compress(&cinfo); free(lum); free(mem); return -1; }
-    jpeg_create_compress(&cinfo);
-    jpeg_mem_dest(&cinfo, &mem, &memlen);
-    cinfo.image_width = (JDIMENSION) w;
-    cinfo.image_height = (JDIMENSION) h;
-    cinfo.input_components = 1;
-    cinfo.in_color_space = JCS_GRAYSCALE;
-    jpeg_set_defaults(&cinfo);
-    jpeg_set_colorspace(&cinfo, JCS_GRAYSCALE);
-    jpeg_set_quality(&cinfo, quality, TRUE);
-    jpeg_start_compress(&cinfo, TRUE);
-    jpeg_write_marker(&cinfo, JPEG_APP0 + 1, G3FAX_MARKER, sizeof G3FAX_MARKER);
-    while (cinfo.next_scanline < cinfo.image_height) {
-        JSAMPROW row = (JSAMPROW) (lum + (size_t) cinfo.next_scanline * w);
-        jpeg_write_scanlines(&cinfo, &row, 1);
-    }
-    jpeg_finish_compress(&cinfo);
-    jpeg_destroy_compress(&cinfo);
+    int rc = jpeg_compress(lum, w, h, 1, JCS_GRAYSCALE, 0, quality, out, out_len);
     free(lum);
-    *out = mem;
-    *out_len = (size_t) memlen;
-    return 0;
+    return rc;
 }
 
 int nf_gray_decode(const uint8_t *bytes, size_t len,
@@ -263,28 +277,8 @@ int nf_gray_decode(const uint8_t *bytes, size_t len,
 {
     if (!bytes || len == 0 || !gray || !w || !h) return -1;
 
-    struct jpeg_decompress_struct dinfo;
-    struct nf_jerr jerr;
-    uint8_t *lum = NULL;
-
-    dinfo.err = jpeg_std_error(&jerr.pub);
-    jerr.pub.error_exit = nf_jpeg_error_exit;
-    if (setjmp(jerr.jb)) { jpeg_destroy_decompress(&dinfo); free(lum); return -1; }
-    jpeg_create_decompress(&dinfo);
-    jpeg_mem_src(&dinfo, bytes, (unsigned long) len);
-    if (jpeg_read_header(&dinfo, TRUE) != JPEG_HEADER_OK) { longjmp(jerr.jb, 1); }
-    dinfo.out_color_space = JCS_GRAYSCALE;
-    jpeg_start_decompress(&dinfo);
-    int W = (int) dinfo.output_width, H = (int) dinfo.output_height;
-    if (dinfo.output_components != 1) { longjmp(jerr.jb, 1); }
-    lum = malloc((size_t) W * H);
-    if (!lum) { longjmp(jerr.jb, 1); }
-    while (dinfo.output_scanline < dinfo.output_height) {
-        JSAMPROW row = (JSAMPROW) (lum + (size_t) dinfo.output_scanline * W);
-        jpeg_read_scanlines(&dinfo, &row, 1);
-    }
-    jpeg_finish_decompress(&dinfo);
-    jpeg_destroy_decompress(&dinfo);
+    uint8_t *lum; int W, H;
+    if (jpeg_decompress(bytes, len, 1, JCS_GRAYSCALE, &lum, &W, &H) != 0) return -1;
 
     /* L* byte -> neutral sRGB grey byte */
     uint8_t *out = malloc((size_t) W * H);

@@ -10,6 +10,11 @@
 #include <stdint.h>
 #include <time.h>
 #include <pthread.h>
+#include <fcntl.h>
+#include <errno.h>
+#if defined(__linux__)
+#include <sys/random.h>
+#endif
 
 /* ── Minimal MD5 (RFC 1321, public domain) ───────────────────────── */
 
@@ -113,12 +118,58 @@ unsigned int rng_seed(void) {
          ^ __sync_fetch_and_add(&counter, 1);
 }
 
+/* Fill buf with n cryptographically-strong random bytes. These seed the SIP
+ * dialog identifiers (Call-ID, From/To tags, Via branch) and the RTP SSRC /
+ * sequence / timestamp; predictable values would let an off-path attacker
+ * forge in-dialog requests or inject media. Prefer getrandom(2), fall back to
+ * /dev/urandom, and only as a last resort (neither available) mix the weak
+ * time/pid seed so we still return non-deterministic-ish bytes rather than
+ * failing or emitting zeros. */
+void rng_bytes(void *buf, size_t n) {
+    uint8_t *p = buf;
+    size_t got = 0;
+#if defined(__linux__)
+    while (got < n) {
+        ssize_t r = getrandom(p + got, n - got, 0);
+        if (r > 0) { got += (size_t) r; continue; }
+        if (r < 0 && errno == EINTR) continue;
+        break;                          /* getrandom unavailable: fall through */
+    }
+#endif
+    if (got < n) {
+        int fd = open("/dev/urandom", O_RDONLY);
+        if (fd >= 0) {
+            while (got < n) {
+                ssize_t r = read(fd, p + got, n - got);
+                if (r > 0) { got += (size_t) r; continue; }
+                if (r < 0 && errno == EINTR) continue;
+                break;
+            }
+            close(fd);
+        }
+    }
+    if (got < n) {                      /* last resort, should not happen */
+        unsigned int s = rng_seed();
+        for (; got < n; got++) { s = s * 1664525u + 1013904223u; p[got] = (uint8_t)(s >> 24); }
+    }
+}
+
+uint32_t rng_u32(void) {
+    uint32_t v;
+    rng_bytes(&v, sizeof(v));
+    return v;
+}
+
 void gen_hex(char *buf, int n) {
     static const char h[] = "0123456789abcdef";
-    unsigned int seed = rng_seed();
-    for (int i = 0; i < n; i++) {
-        seed = seed * 1664525u + 1013904223u;
-        buf[i] = h[(seed >> 24) & 0xF];
+    uint8_t rnd[64];
+    int off = 0;
+    while (off < n) {
+        int chunk = n - off;
+        if (chunk > (int) sizeof(rnd)) chunk = (int) sizeof(rnd);
+        rng_bytes(rnd, (size_t) chunk);
+        for (int i = 0; i < chunk; i++) buf[off + i] = h[rnd[i] & 0xF];
+        off += chunk;
     }
     buf[n] = '\0';
 }

@@ -2,6 +2,8 @@
 #define SIP_UTIL_H
 
 #include <time.h>
+#include <stddef.h>
+#include <stdint.h>
 
 /* Small helpers shared by sip_interface.c (the registrar/answer/dial driver)
  * and call.c (per-call SIP/RTP handling): MD5 for digest auth, a tiny PRNG for
@@ -15,12 +17,18 @@ void md5_hex(const char *s, char out[33]);
 
 /* ── Random hex tokens ────────────────────────────────────────────── */
 
-/* A PRNG seed mixing time, pid, thread id and a per-process atomic counter, so
- * threads created within the same second don't collide (e.g. on RTP SSRCs). */
+/* Weak time/pid/tid seed, retained only as the last-resort fallback inside
+ * rng_bytes() when no OS randomness source is available. Not for security use. */
 unsigned int rng_seed(void);
 
+/* Fill buf with n cryptographically-strong random bytes (getrandom/urandom). */
+void rng_bytes(void *buf, size_t n);
+
+/* A cryptographically-strong random 32-bit value (RTP SSRC/seq/timestamp). */
+uint32_t rng_u32(void);
+
 /* Fill buf with n random lowercase hex digits plus a NUL (needs n+1 bytes).
- * Used for SIP branch/tag tokens and Call-IDs. */
+ * Cryptographically strong. Used for SIP branch/tag tokens and Call-IDs. */
 void gen_hex(char *buf, int n);
 
 /* ── SIP message parsing ──────────────────────────────────────────── */

@@ -22,7 +22,13 @@ enum {
     NF_SIG_TRAINING_IN_PROGRESS = -3,
     NF_SIG_TRAINING_SUCCEEDED   = -4,
     NF_SIG_TRAINING_FAILED      = -5,
-    NF_SIG_END_OF_DATA          = -7
+    NF_SIG_END_OF_DATA          = -7,
+    /* -8 is taken: nf_hdlc reports rx aborts as -8 (spandsp's
+     * SIG_STATUS_ABORT) through the same status plumbing */
+    /* a queued tx data section finished going out while the carrier stays up
+     * (the V.34 control channel holds flags between frames, so there is no
+     * "burst ended" moment to infer completion from) */
+    NF_SIG_SEND_COMPLETE        = -9
 };
 
 /* ── complex float ─────────────────────────────────────────────────── */
