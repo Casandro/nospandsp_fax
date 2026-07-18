@@ -93,6 +93,11 @@ struct nf_t38 {
     int  tx_ind_left;       /* extra repeats of the current indicator     */
     int  tx_dt;             /* data type for the current burst           */
     int  tx_bit_rate;       /* for pacing non-ECM data                   */
+    int  red_ls;            /* UDPTL redundancy for low-speed control (indicators,
+                             * V.21 HDLC: DIS/DCS/CFR/EOP/MCF...) - critical, few  */
+    int  red_hs;            /* UDPTL redundancy for high-speed image data (non-ECM/
+                             * ECM); non-ECM has no retransmission, so loss here is
+                             * unrecoverable within the page                        */
     int  tx_is_hdlc;        /* current carrier carries HDLC              */
     int  tx_is_stream;      /* ECM: pull frames via up.hdlc_get_frame    */
     int  tx_wait_ms;        /* remaining delay for tone/pause phases     */
@@ -161,6 +166,7 @@ static void emit_indicator(nf_t38_t *s, int ind)
 {
     uint8_t ifp[4];
     if (t38dbg()) fprintf(stderr, "[T38 TX] IND %s\n", ind_name(ind));
+    s->udptl.red_entries = s->red_ls;       /* indicators are control-plane */
     emit(s, ifp, ifp_indicator(ifp, ind));
 }
 
@@ -169,6 +175,10 @@ static void emit_data(nf_t38_t *s, int ft, const uint8_t *p, int plen)
     uint8_t ifp[NF_UDPTL_MAXIFP];
     int n = ifp_data(ifp, s->tx_dt, ft, p, plen);
     if (t38dbg()) fprintf(stderr, "[T38 TX] %s len=%d\n", ft_name(ft), plen);
+    /* Low-speed V.21 HDLC control (DCS/EOP/MCF/...) uses the higher red_ls;
+     * any high-speed carrier data (non-ECM image, or ECM FCD/RCP HDLC) uses
+     * red_hs. tx_dt==DT_V21 marks the control channel. */
+    s->udptl.red_entries = (s->tx_dt == DT_V21) ? s->red_ls : s->red_hs;
     emit(s, ifp, n);
 }
 
@@ -605,6 +615,17 @@ nf_t38_t *nf_t38_init(int calling_party, const nf_fax_iface_t *iface,
     s->send = send;
     s->send_user = send_user;
     nf_udptl_init(&s->udptl, redundancy, far_max_datagram);
+    /* T.38 practice: give the sparse-but-critical low-speed control frames more
+     * UDPTL redundancy than the voluminous high-speed image data. Defaults:
+     * control = redundancy+2 (>=3), image = redundancy. Override per path with
+     * NF_T38_RED_LS / NF_T38_RED_HS to tune against a lossy gateway. */
+    s->red_hs = redundancy;
+    s->red_ls = redundancy + 2;
+    { const char *e;
+      if ((e = getenv("NF_T38_RED_LS"))) s->red_ls = atoi(e);
+      if ((e = getenv("NF_T38_RED_HS"))) s->red_hs = atoi(e); }
+    if (s->red_ls < 0) s->red_ls = 0;
+    if (s->red_hs < 0) s->red_hs = 0;
     s->tx_phase = TX_IDLE;
     return s;
 }

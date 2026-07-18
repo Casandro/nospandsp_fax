@@ -127,6 +127,13 @@ void sip_t38_reanswer(sip_media_t *dlg, const char *req, struct sockaddr_in *fro
 /* Tear the call down: send BYE (or 200 to a pending BYE) and close sockets. */
 void sip_media_hangup(sip_media_t *m);
 
+/* Install SIGTERM/SIGINT handlers that request a graceful stop. The signal only
+ * sets a flag; callers must poll sip_stop_requested() in their media loop and
+ * unwind so the call is ended with a proper CANCEL (still ringing) or BYE
+ * (established) - vital when the process is killed by e.g. `timeout` mid-call. */
+void sip_install_hangup_signals(void);
+int  sip_stop_requested(void);
+
 /* ── Daemon-mode building blocks (concurrent, fork-per-call) ──────────────
  *
  * The daemon owns ONE listening socket (the parent's SIP control plane); a

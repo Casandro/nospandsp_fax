@@ -1,5 +1,7 @@
 #include "nf_v8.h"
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
 
 /* ── modulation-mode octet codec (verified against a real captured CM/JM:
  * bytes 81 85 D4 90 decoded to call-function T.30 Tx FAX and modulations
@@ -354,6 +356,13 @@ static int ansam_tx_gen(nf_v8_ansam_tx_t *a, int16_t *amp, int max_len)
 /* presence needed before the caller acts on the tone: by then one clean
  * (post-onset) AM window has completed and am_class is authoritative */
 #define ANSAM_DECIDE_MS  350
+/* V.8 8.1.1/8.1.2: after detecting ANSam the caller stops its call signal and
+ * transmits NO signal for a period Te before sending CM. V.8 sets the minimum Te
+ * at 0.5 s, and Te >= 1 s only "if it is desired to allow for network echo
+ * canceller disabling". We use the 0.5 s minimum: these GSTN/VoIP paths show a
+ * plain echo of our own signal (i.e. no echo canceller is engaged), so the
+ * longer EC-disable value would only add pointless latency. */
+#define V8_TE_MS 500
 
 static void ansam_rx_init(nf_v8_ansam_rx_t *r)
 {
@@ -443,6 +452,7 @@ enum {
     ST_ANS_ANSAM,     /* answerer: emitting ANSam, listening for CM (ch1) */
     ST_ANS_JM,        /* answerer: emitting JM, listening for CJ (ch1)   */
     ST_CALL_CI,       /* caller: emitting CI bursts, listening for ANSam */
+    ST_CALL_TE,       /* caller: ANSam heard, silent for Te before CM (8.1.1) */
     ST_CALL_CM,       /* caller: emitting CM, listening for JM (ch2)     */
     ST_CALL_CJ,       /* caller: emitting CJ, timed hold then done       */
     ST_DONE
@@ -588,12 +598,25 @@ int nf_v8_rx(nf_v8_t *s, const int16_t *amp, int len)
              * (a classic answerer starts phase B right after its CED). */
             s->result.ansam_am = s->ansam_rx.am_class;
             if (s->ansam_rx.am_class == 1) {
-                arm_cm(s);
-                s->state = ST_CALL_CM;
-                s->timer = NF_SAMPLE_RATE * 5;                   /* 5s for JM */
+                /* V.8 8.1.1: stop the call signal (CI) and transmit nothing for
+                 * Te before CM, so the ANSam's phase reversals disable any
+                 * network echo canceller first (nf_v8_tx is silent in this
+                 * state). CM is never sent before ANSam (V.8 7.2). */
+                if (getenv("NFV34DBG"))
+                    fprintf(stderr, "[v8] ANSam detected; silent Te (%d ms) before CM\n", V8_TE_MS);
+                s->state = ST_CALL_TE;
+                s->timer = NF_SAMPLE_RATE * V8_TE_MS / 1000;
             } else {
                 report(s, NF_V8_STATUS_NON_V8_CALL);
             }
+        } else if (s->fsk_rx.flags_run >= 32) {
+            /* No ANSam, but a T.30-style V.21(H) carrier (HDLC flags) on the
+             * answer channel: this answerer skipped V.8 and is already in the
+             * V.21 message phase. Do NOT send CM (V.8 7.2 needs ANSam first) -
+             * hand straight to T.30 so it catches the DIS. */
+            if (getenv("NFV34DBG"))
+                fprintf(stderr, "[v8] V.21 carrier (no ANSam) -> T.30, no CM\n");
+            report(s, NF_V8_STATUS_NON_V8_CALL);
         } else if (!s->fsk_tx.active) {
             /* CI burst finished: fall silent for an inter-burst gap (still
              * listening for ANSam), then re-send the burst. */
@@ -608,6 +631,18 @@ int nf_v8_rx(nf_v8_t *s, const int16_t *amp, int len)
                 report(s, NF_V8_STATUS_NON_V8_CALL);
         } else if (s->timer <= 0) {
             report(s, NF_V8_STATUS_NON_V8_CALL);
+        }
+        break;
+
+    case ST_CALL_TE:
+        /* Silent gap Te after ANSam detection (nf_v8_tx emits nothing here).
+         * When it elapses, transmit CM. */
+        if (s->timer <= 0) {
+            if (getenv("NFV34DBG"))
+                fprintf(stderr, "[v8] Te elapsed -> sending CM\n");
+            arm_cm(s);
+            s->state = ST_CALL_CM;
+            s->timer = NF_SAMPLE_RATE * 5;                       /* 5s for JM */
         }
         break;
 

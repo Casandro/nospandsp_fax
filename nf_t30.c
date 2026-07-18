@@ -1506,6 +1506,12 @@ static void on_hdlc(void *user, const uint8_t *msg, int len, int ok)
 {
     nf_t30_t *s = user;
     vlog(s, "rx frame fcf=0x%02x len=%d ok=%d (state %d)", len>=3?msg[2]:0, len, ok, s->substate);
+    if (s->verbose && len > 0) {         /* raw frame bytes, for analysing odd peers */
+        char h[3 * 64 + 8]; int p = 0, m = len > 64 ? 64 : len;
+        for (int i = 0; i < m && p < (int) sizeof h - 4; i++)
+            p += snprintf(h + p, sizeof h - (size_t) p, "%02x ", msg[i]);
+        vlog(s, "  raw: %s%s", h, len > m ? "..." : "");
+    }
     if (!ok || len < 3) return;
     int fcf = msg[2] | 0x01;             /* ignore X bit for dispatch */
     disarm_timeout(s);

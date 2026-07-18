@@ -638,6 +638,20 @@ static int g_last_v34_failed = 0;/* the call just run negotiated V.34 and did
 /* copy of the whole trace to <dir>/session.log).                      */
 /* ------------------------------------------------------------------ */
 static char g_debug_dir[512];   /* set non-empty when --debug is active */
+static FILE *g_t38dump = NULL;  /* --debug: timestamped hex of every UDPTL datagram */
+
+/* Append one datagram to the T.38 dump: "HH:MM:SS.mmm R/T Nb: <hex>". */
+static void t38_dump(char dir, const uint8_t *d, int len)
+{
+    if (!g_t38dump) return;
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm; localtime_r(&ts.tv_sec, &tm);
+    fprintf(g_t38dump, "%02d:%02d:%02d.%03ld %c %3dB:",
+            tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000, dir, len);
+    for (int i = 0; i < len && i < 256; i++) fprintf(g_t38dump, " %02x", d[i]);
+    fputc('\n', g_t38dump);
+    fflush(g_t38dump);
+}
 
 /* Tee stderr to <dir>/session.log while still echoing to the console. A small
  * forked relay copies the pipe to both sinks; no pthread dependency, and it
@@ -708,6 +722,11 @@ static const char *setup_debug(const char *dir)
         static char pcm[600];
         snprintf(pcm, sizeof pcm, "%s/rx.pcm", g_debug_dir);
         setenv("NF_RX_AUDIO_DUMP", pcm, 1);
+    }
+    if (!getenv("NF_TX_AUDIO_DUMP")) {
+        static char pcm[600];
+        snprintf(pcm, sizeof pcm, "%s/tx.pcm", g_debug_dir);
+        setenv("NF_TX_AUDIO_DUMP", pcm, 1);
     }
 
     char logpath[600];
@@ -1025,6 +1044,9 @@ static int run_fax_sip(sip_media_t *m, int sending, const char *file,
     /* DEBUG (diagnostic only): dump inbound decoded PCM (16-bit LE 8 kHz mono)
      * for offline signal analysis. Gated by NF_RX_AUDIO_DUMP=<path>. */
     FILE *adump = getenv("NF_RX_AUDIO_DUMP") ? fopen(getenv("NF_RX_AUDIO_DUMP"), "wb") : NULL;
+    /* Symmetric TX dump for offline analysis (e.g. verifying our V.8 CM/CI
+     * timing against the received ANSam). Gated by NF_TX_AUDIO_DUMP=<path>. */
+    FILE *tdump = getenv("NF_TX_AUDIO_DUMP") ? fopen(getenv("NF_TX_AUDIO_DUMP"), "wb") : NULL;
 
     struct timespec next_tick, next_prog;
     clock_gettime(CLOCK_MONOTONIC, &next_tick);
@@ -1032,6 +1054,7 @@ static int run_fax_sip(sip_media_t *m, int sending, const char *file,
     ts_add_ms(&next_tick, 20);
 
     for (;;) {
+        if (sip_stop_requested()) break;   /* SIGTERM/SIGINT: unwind so main sends BYE */
         if (sending) tx_progress(fax, &next_prog, &pmode, verbose, 0);
         /* Until the next 20 ms tick, service whichever socket is ready:
          * decode inbound RTP into the fax receiver, answer in-dialog SIP. */
@@ -1048,13 +1071,14 @@ static int run_fax_sip(sip_media_t *m, int sending, const char *file,
                 if (sip_media_poll_sip(m)) ended = 1;
                 /* The peer re-INVITEd us to T.38 and we accepted: abandon the
                  * audio engine; the caller restarts the call over T.38. */
-                if (sip_media_is_t38(m)) { if (adump) fclose(adump); nf_t30_free(fax); return -2; }
+                if (sip_media_is_t38(m)) { if (adump) fclose(adump); if (tdump) fclose(tdump); nf_t30_free(fax); return -2; }
             }
         }
 
         /* Tick: pull one frame from the fax transmitter and send it as RTP. */
         ts_add_ms(&next_tick, 20);
         fax_tx_block(fax, out);
+        if (tdump) fwrite(out, sizeof(int16_t), SAMPLES_PER_BLOCK, tdump);
         sip_media_tx(m, out, SAMPLES_PER_BLOCK);
 
         /* After local completion (Phase E) or a peer hang-up, run a bounded
@@ -1064,6 +1088,7 @@ static int run_fax_sip(sip_media_t *m, int sending, const char *file,
 
     if (sending) tx_progress(fax, &next_prog, &pmode, verbose, 1);
     if (adump) fclose(adump);
+    if (tdump) fclose(tdump);
     {   /* Remember a failed V.34 attempt so the dialer can redial classic G3. */
         nf_t30_stats_t st;
         nf_t30_get_stats(fax, &st);
@@ -1082,6 +1107,7 @@ static int run_fax_sip(sip_media_t *m, int sending, const char *file,
 
 static void t38_send_cb(void *user, const uint8_t *dgram, int len)
 {
+    t38_dump('T', dgram, len);
     sip_t38_tx((sip_media_t *) user, dgram, len);
 }
 
@@ -1095,6 +1121,10 @@ static int run_fax_t38(sip_media_t *m, int sending, const char *file,
     nf_t30_t38_enable(fax, 2 /*redundancy*/,
                       m->t38_far_datagram > 0 ? m->t38_far_datagram : 300,
                       t38_send_cb, m);
+    if (g_debug_dir[0]) {
+        char p[600]; snprintf(p, sizeof p, "%s/t38.log", g_debug_dir);
+        g_t38dump = fopen(p, "w");
+    }
 
     int flush = 0, ended = 0, pmode = -1;
     struct timespec next_tick, next_prog;
@@ -1103,6 +1133,7 @@ static int run_fax_t38(sip_media_t *m, int sending, const char *file,
     ts_add_ms(&next_tick, 30);
 
     for (;;) {
+        if (sip_stop_requested()) break;   /* SIGTERM/SIGINT: unwind so main sends BYE */
         if (sending) tx_progress(fax, &next_prog, &pmode, verbose, 0);
         /* Until the next 30 ms tick, drain inbound UDPTL and service SIP. */
         fd_set rfds;
@@ -1110,7 +1141,7 @@ static int run_fax_t38(sip_media_t *m, int sending, const char *file,
             if (FD_ISSET(m->t38_sock, &rfds)) {
                 uint8_t dg[2048];
                 int n = sip_t38_rx(m, dg, sizeof dg);
-                if (n > 0) nf_t30_t38_rx_datagram(fax, dg, n);
+                if (n > 0) { t38_dump('R', dg, n); nf_t30_t38_rx_datagram(fax, dg, n); }
             }
             if (FD_ISSET(m->sip_sock, &rfds)) {
                 if (sip_media_poll_sip(m)) ended = 1;
@@ -1124,6 +1155,7 @@ static int run_fax_t38(sip_media_t *m, int sending, const char *file,
     }
 
     if (sending) tx_progress(fax, &next_prog, &pmode, verbose, 1);
+    if (g_t38dump) { fclose(g_t38dump); g_t38dump = NULL; }
     int rc = fax_result(&cs, ended);
     debug_write_report(fax, sending, rc);
     nf_t30_free(fax);
@@ -1255,7 +1287,7 @@ static int run_fax_t38_child(sip_media_t *m, int ctrl_fd, const char *tiff_path,
             if (FD_ISSET(m->t38_sock, &rfds)) {
                 uint8_t dg[2048];
                 int n = sip_t38_rx(m, dg, sizeof dg);
-                if (n > 0) nf_t30_t38_rx_datagram(fax, dg, n);
+                if (n > 0) { t38_dump('R', dg, n); nf_t30_t38_rx_datagram(fax, dg, n); }
             }
             if (FD_ISSET(ctrl_fd, &rfds)) {
                 struct dctl_msg msg; int rfd = -1;
@@ -2172,6 +2204,9 @@ int main(int argc, char **argv)
     int rc;
 
     if (use_sip) {
+        /* Ensure a SIGTERM/SIGINT (e.g. `timeout` firing) ends the call with a
+         * BYE/CANCEL instead of leaving it dangling on the far end/gateway. */
+        sip_install_hangup_signals();
         for (;;) {
             sip_media_t media;
             if (sip_media_establish(&scfg, &media) != 0) {
@@ -2187,6 +2222,7 @@ int main(int argc, char **argv)
                     rc = run_fax_t38(&media, sending, fax_file, ident, verbose, doc);
             }
             sip_media_hangup(&media);
+            if (sip_stop_requested()) break;   /* stop signal: no redial */
             /* A dialed call that negotiated V.34 but failed gets one redial as
              * classic G3: some SG3 machines advertise capabilities their V.34
              * stack cannot actually receive (seen in the field with JPEG). */

@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <signal.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <stdarg.h>
@@ -718,6 +719,7 @@ static void send_ack(sip_media_t *m, const sip_config_t *cfg,
     if (n >= (int)sizeof(m->ok_buf)) n = (int)sizeof(m->ok_buf) - 1;
     m->ok_buf_len = n;            /* kept so a retransmitted 2xx can be re-ACKed */
     sip_send(m->sip_sock, m->ok_buf, n, &m->sip_peer);
+    vlog(m, "TX", m->ok_buf);     /* ACKs must be visible in the trace */
 }
 
 /* Cancel an INVITE that is in progress (a provisional was received but no final
@@ -787,6 +789,26 @@ static void await_cancel_final(sip_media_t *m, const sip_config_t *cfg,
     }
 }
 
+/* Graceful-shutdown flag. When the process is asked to stop (SIGTERM/SIGINT -
+ * e.g. `timeout` firing during a call), we must not just die: an established
+ * call has to be torn down with a BYE (and a call still ringing with a CANCEL),
+ * or the far end / gateway is left with a dangling call. The signal handler only
+ * sets this flag; the INVITE wait loop and the media loops poll it and unwind
+ * through the normal CANCEL/BYE paths. */
+static volatile sig_atomic_t g_sip_stop = 0;
+static void sip_on_stop_signal(int s) { (void) s; g_sip_stop = 1; }
+
+void sip_install_hangup_signals(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = sip_on_stop_signal;   /* no SA_RESTART: interrupt the select() */
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
+}
+
+int sip_stop_requested(void) { return g_sip_stop; }
+
 static int uac_establish(const sip_config_t *cfg, sip_media_t *m)
 {
     struct sockaddr_in proxy;
@@ -852,6 +874,18 @@ static int uac_establish(const sip_config_t *cfg, sip_media_t *m)
     int provisional = 0;
 
     for (;;) {
+        if (g_sip_stop) {
+            /* Asked to quit mid-setup: cancel a ringing INVITE cleanly, else
+             * just give up (nothing is established yet, so no BYE is owed). */
+            if (provisional) {
+                fprintf(stderr, "INVITE: stop requested - cancelling\n");
+                send_cancel(m, cfg, target_uri, from_tag, branch, cseq);
+                await_cancel_final(m, cfg, target_uri, from_tag, branch, cseq);
+            } else {
+                fprintf(stderr, "INVITE: stop requested before answer\n");
+            }
+            return -1;
+        }
         long wg = ts_until_ms(&giveup);
         if (wg <= 0) {
             if (provisional) {
@@ -873,7 +907,10 @@ static int uac_establish(const sip_config_t *cfg, sip_media_t *m)
         char resp[8192];
         struct sockaddr_in from;
         int r = sip_recv(m->sip_sock, resp, sizeof(resp), (int)wms, &from);
-        if (r < 0) return -1;
+        if (r < 0) {
+            if (g_sip_stop) continue;       /* signal interrupted the wait: cancel at top */
+            return -1;
+        }
 
         if (r == 0) {                       /* timeout: retransmit INVITE */
             if (!provisional && ts_until_ms(&next_tx) <= 0) {
@@ -925,16 +962,27 @@ static int uac_establish(const sip_config_t *cfg, sip_media_t *m)
 
         if (code < 300) {                   /* 2xx: answered */
             char rip[64]; int rport;
+            /* RFC 3261 §13.2.2.4: the ACK for a 2xx is a fresh request whose
+             * request-URI is the remote target - the Contact URI of the 200 OK,
+             * not the AOR we INVITEd. An SBC/B2BUA keys its dialog on that
+             * Contact; ACKing the original AOR leaves it unmatched, so the UAS
+             * retransmits the 200 OK (the "many 200 OKs" symptom). Fall back to
+             * target_uri only if the 2xx carried no Contact. */
+            char contact[512] = "", ruri[600];
+            sip_hdr(resp, "Contact", contact, sizeof(contact));
+            if (contact[0]) extract_uri(contact, ruri, sizeof(ruri));
+            else            snprintf(ruri, sizeof(ruri), "%s", target_uri);
             if (!parse_sdp(sip_body(resp), rip, &rport)) {
                 fprintf(stderr, "200 OK has no usable PCMA SDP\n");
-                send_ack(m, cfg, target_uri, from_tag, to_hdr, cseq, 1, branch);
+                send_ack(m, cfg, ruri, from_tag, to_hdr, cseq, 1, branch);
                 return -1;
             }
             set_remote_rtp(m, rip, rport);
-            send_ack(m, cfg, target_uri, from_tag, to_hdr, cseq, 1, branch);
+            send_ack(m, cfg, ruri, from_tag, to_hdr, cseq, 1, branch);
 
-            /* Record dialog state so hangup() can emit an in-dialog BYE. */
-            snprintf(m->bye_ruri, sizeof(m->bye_ruri), "%s", target_uri);
+            /* Record dialog state so hangup() can emit an in-dialog BYE - which
+             * targets the same remote-target Contact URI. */
+            snprintf(m->bye_ruri, sizeof(m->bye_ruri), "%s", ruri);
             snprintf(m->bye_from, sizeof(m->bye_from),
                      "<sip:%s@%s>;tag=%s", cfg->local_user, cfg->registrar_host, from_tag);
             snprintf(m->bye_to, sizeof(m->bye_to), "%s", to_hdr);
@@ -1259,6 +1307,13 @@ int sip_media_poll_sip(sip_media_t *m)
     char method[32];
     sip_method(buf, method, sizeof(method));
 
+    /* OPTIONS is a capability/keep-alive probe (often out-of-dialog, e.g. from
+     * the proxy). Always answer 200 OK so the peer sees us as alive. */
+    if (strcasecmp(method, "OPTIONS") == 0) {
+        sip_dialog_respond(m, buf, "200 OK", &from);
+        return 0;
+    }
+
     /* Only in-dialog requests from our peer may tear down or renegotiate the
      * call; anything else on the port is ignored (no teardown, no media move). */
     if ((strcasecmp(method, "BYE") == 0 || strcasecmp(method, "INVITE") == 0) &&
@@ -1333,20 +1388,32 @@ void sip_call_send_bye(sip_media_t *m)
 }
 
 /* Send an in-dialog ACK (new branch) for a 2xx to our re-INVITE. */
-static void t38_send_ack(sip_media_t *m, const char *to_hdr, int cseq)
+/* ACK a response to our re-INVITE. RFC 3261 §17.1.1.3/§13.2.2.4: a non-2xx ACK
+ * is part of the INVITE transaction and MUST reuse the INVITE's Via branch
+ * (new_branch=0, reinv_branch); a 2xx ACK is a new transaction with a fresh
+ * branch (new_branch=1). Using a fresh branch for a non-2xx ACK leaves it
+ * unmatched, so the far end retransmits the final response (the 488/2xx storm). */
+static void t38_send_ack(sip_media_t *m, const char *to_hdr, int cseq,
+                         int new_branch, const char *reinv_branch)
 {
-    char branch[20];
-    gen_branch(branch);
-    char ack[1024];
-    int n = snprintf(ack, sizeof(ack),
+    char branch[40];
+    if (new_branch) gen_branch(branch);
+    else { strncpy(branch, reinv_branch, sizeof(branch) - 1); branch[sizeof(branch)-1] = '\0'; }
+    /* Build into m->ok_buf so poll_sip can replay this exact ACK if the re-
+     * INVITE's 2xx is retransmitted (our first ACK lost). Previously it used a
+     * local buffer, so a retransmitted re-INVITE 200 got the stale initial-
+     * INVITE ACK (wrong CSeq) replayed and the 2xx storm never stopped. */
+    int n = snprintf(m->ok_buf, sizeof(m->ok_buf),
         "ACK %s SIP/2.0\r\n"
         "Via: SIP/2.0/UDP %s:%d;branch=%s;rport\r\n"
         "Max-Forwards: 70\r\nFrom: %s\r\nTo: %s\r\nCall-ID: %s\r\n"
         "CSeq: %d ACK\r\nContent-Length: 0\r\n\r\n",
         m->bye_ruri, m->local_ip, m->local_sip_port, branch,
         m->bye_from, to_hdr, m->call_id, cseq);
-    if (n >= (int)sizeof(ack)) n = (int)sizeof(ack) - 1;   /* clamp before sendto */
-    sip_send(m->sip_sock, ack, n, &m->sip_peer);
+    if (n >= (int)sizeof(m->ok_buf)) n = (int)sizeof(m->ok_buf) - 1;
+    m->ok_buf_len = n;
+    sip_send(m->sip_sock, m->ok_buf, n, &m->sip_peer);
+    vlog(m, "TX", m->ok_buf);
 }
 
 int sip_offer_t38(sip_media_t *m, const sip_config_t *cfg)
@@ -1394,9 +1461,11 @@ int sip_offer_t38(sip_media_t *m, const sip_config_t *cfg)
                 }
                 continue;                               /* ignore others */
             }
+            if (code < 200)                             /* 100/18x: keep waiting */
+                continue;                               /* for the final response */
             char to_hdr[300] = ""; sip_hdr(resp, "To", to_hdr, sizeof(to_hdr));
             if (code >= 200 && code < 300) {
-                t38_send_ack(m, to_hdr[0] ? to_hdr : m->bye_to, my_cseq);
+                t38_send_ack(m, to_hdr[0] ? to_hdr : m->bye_to, my_cseq, 1, branch);
                 char rip[64]; int tport = 0, fdg = T38_MAX_DATAGRAM;
                 if (parse_t38_sdp(sip_body(resp), rip, &tport, &fdg)) {
                     set_t38_peer(m, rip, tport);
@@ -1408,13 +1477,13 @@ int sip_offer_t38(sip_media_t *m, const sip_config_t *cfg)
                 return 0;                               /* accepted but not T.38 */
             }
             if ((code == 401 || code == 407) && attempt == 0 && cfg->password[0]) {
-                t38_send_ack(m, to_hdr[0] ? to_hdr : m->bye_to, my_cseq); /* ACK the 4xx */
+                t38_send_ack(m, to_hdr[0] ? to_hdr : m->bye_to, my_cseq, 0, branch); /* ACK the 4xx */
                 challenge(resp, realm, nonce, qop, opaque);
                 retry = 1;
                 break;
             }
             /* Other failure (e.g. 488): the far end won't do T.38. */
-            t38_send_ack(m, to_hdr[0] ? to_hdr : m->bye_to, my_cseq);
+            t38_send_ack(m, to_hdr[0] ? to_hdr : m->bye_to, my_cseq, 0, branch);
             return 0;
         }
         if (!retry) break;
