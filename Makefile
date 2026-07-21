@@ -15,6 +15,12 @@ SPANDSP_LIBS   = $(shell pkg-config --libs spandsp)
 # modems on top).
 OBJS = sip_fax.o sip.o sip_util.o g711.o nf_t4.o nf_t30.o nf_fax.o nf_color.o nf_dsp.o nf_hdlc.o nf_v21.o nf_qam.o nf_v29.o nf_v27.o nf_v17.o nf_v8.o nf_v34.o nf_udptl.o nf_t38.o
 
+# The full fax-engine source set that every end-to-end test harness links (the
+# sip_* front-end files are excluded — each harness supplies its own main()).
+# Referenced by the nf_faxloop2/ctctest/interop/ecmtest/xfer/v34fax/t38* rules
+# so a new engine module is added in one place, not nine.
+ENGINE_SRCS = nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c
+
 sip_fax: $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
@@ -53,21 +59,24 @@ tests/nf_t4check: tests/nf_t4check.c nf_t4.c nf_t4.h
 	$(CC) $(CFLAGS) $(SPANDSP_CFLAGS) -I. -o $@ tests/nf_t4check.c nf_t4.c $(SPANDSP_LIBS) $(LDLIBS)
 tests/nf_faxloop: tests/nf_faxloop.c nf_fax.c nf_v8.c nf_v34.c nf_fax.h nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c
 	$(CC) $(CFLAGS) -I. -o $@ tests/nf_faxloop.c nf_fax.c nf_v8.c nf_v34.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c $(LDLIBS)
-tests/nf_faxloop2: tests/nf_faxloop2.c nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c
-	$(CC) $(CFLAGS) -I. -o $@ tests/nf_faxloop2.c nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c $(LDLIBS)
-tests/nf_ctctest: tests/nf_ctctest.c nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c
-	$(CC) $(CFLAGS) -I. -o $@ tests/nf_ctctest.c nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c $(LDLIBS)
-tests/nf_interop: tests/nf_interop.c nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c
-	$(CC) $(CFLAGS) $(SPANDSP_CFLAGS) -I. -o $@ tests/nf_interop.c nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c $(SPANDSP_LIBS) $(LDLIBS)
+tests/nf_faxloop2: tests/nf_faxloop2.c $(ENGINE_SRCS)
+	$(CC) $(CFLAGS) -I. -o $@ tests/nf_faxloop2.c $(ENGINE_SRCS) $(LDLIBS)
+tests/nf_ctctest: tests/nf_ctctest.c $(ENGINE_SRCS)
+	$(CC) $(CFLAGS) -I. -o $@ tests/nf_ctctest.c $(ENGINE_SRCS) $(LDLIBS)
+tests/nf_interop: tests/nf_interop.c $(ENGINE_SRCS)
+	$(CC) $(CFLAGS) $(SPANDSP_CFLAGS) -I. -o $@ tests/nf_interop.c $(ENGINE_SRCS) $(SPANDSP_LIBS) $(LDLIBS)
 # nf_ecmtest : nf_t30 (ECM) against spandsp (ECM + T.6), with frame-loss injection
-tests/nf_ecmtest: tests/nf_ecmtest.c nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c
-	$(CC) $(CFLAGS) $(SPANDSP_CFLAGS) -I. -o $@ tests/nf_ecmtest.c nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c $(SPANDSP_LIBS) $(LDLIBS)
+tests/nf_ecmtest: tests/nf_ecmtest.c $(ENGINE_SRCS)
+	$(CC) $(CFLAGS) $(SPANDSP_CFLAGS) -I. -o $@ tests/nf_ecmtest.c $(ENGINE_SRCS) $(SPANDSP_LIBS) $(LDLIBS)
 # nf_colortest : offline unit test for the nf_color T.42/JPEG codec
 tests/nf_colortest: tests/nf_colortest.c nf_color.c nf_color.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/nf_colortest.c nf_color.c -ljpeg -lm
+# nf_md5test : MD5 known-answer test (guards the SIP Digest hash in sip_util.c)
+tests/nf_md5test: tests/nf_md5test.c sip_util.c sip_util.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/nf_md5test.c sip_util.c -lpthread
 # nf_xfer : nf<->nf colour and binary-file transfer over the full ECM engine
-tests/nf_xfer: tests/nf_xfer.c nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c
-	$(CC) $(CFLAGS) -I. -o $@ tests/nf_xfer.c nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c $(LDLIBS)
+tests/nf_xfer: tests/nf_xfer.c $(ENGINE_SRCS)
+	$(CC) $(CFLAGS) -I. -o $@ tests/nf_xfer.c $(ENGINE_SRCS) $(LDLIBS)
 # nf_modemtest : per-module oracle tests of the nf modem layer vs real spandsp
 tests/nf_modemtest: tests/nf_modemtest.c nf_fax.c nf_v8.c nf_v34.c g711.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c nf_dsp.h nf_hdlc.h nf_v21.h nf_qam.h nf_v29.h nf_v27.h nf_v17.h
 	$(CC) $(CFLAGS) $(SPANDSP_CFLAGS) -I. -o $@ tests/nf_modemtest.c nf_fax.c nf_v8.c nf_v34.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c g711.c $(SPANDSP_LIBS) $(LDLIBS)
@@ -84,12 +93,36 @@ tests/nf_v34test: tests/nf_v34test.c nf_v34.c nf_v34.h nf_dsp.c nf_dsp.h nf_hdlc
 # nf_v34fax : end-to-end fax over V.34 (T.30 Annex F) - two nf_t30 engines in
 # audio loopback run the whole Super-G3 session (V.8 V.34HDX, clause-12
 # startup, control-channel T.30, primary-channel ECM page) - see check-v34fax.
-tests/nf_v34fax: tests/nf_v34fax.c nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c
-	$(CC) $(CFLAGS) -I. -o $@ tests/nf_v34fax.c nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c $(LDLIBS)
+tests/nf_v34fax: tests/nf_v34fax.c $(ENGINE_SRCS)
+	$(CC) $(CFLAGS) -I. -o $@ tests/nf_v34fax.c $(ENGINE_SRCS) $(LDLIBS)
 
 # Fast, deterministic codec check.
 check: tests/nf_t4check
 	./tests/nf_t4check doc.pam
+
+# MD5 known-answer test: guards the SIP Digest hash against silent regressions.
+check-md5: tests/nf_md5test
+	./tests/nf_md5test
+
+# AddressSanitizer + UBSan pass over the offline suites. Rebuilds the harnesses
+# instrumented (clean first, so no stale un-instrumented binary is reused) and
+# runs the memory-safety-relevant ones: the T.4 codec, the T.30 ECM/colour/file
+# paths, T.38/UDPTL parsing, the full fax loop, and the MD5 KAT.
+#
+# ASan is the hard gate: any heap-overflow / use-after-free / OOB aborts the run
+# (this is what would have caught the two heap bugs fixed in the audit). UBSan
+# runs in report (recover) mode: it currently prints KNOWN-BENIGN signed-overflow
+# diagnostics from the modems' deliberate modular phase arithmetic (e.g.
+# nf_v17.c phase-delta subtraction) — those wrap intentionally and are pending a
+# separate UB-cleanup pass (unsigned-subtract-then-cast); they are not failures.
+#
+# Slower than a normal run; needs spandsp like the other checks. Run `make` again
+# afterwards to restore the normal optimised build. (Needs a -fsanitize compiler.)
+ASAN_CFLAGS = -Wall -Wextra -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
+asan:
+	$(MAKE) clean
+	$(MAKE) CFLAGS="$(ASAN_CFLAGS)" check check-md5 check-color check-t38 check-fax check-ecm
+	@echo "== ASAN/UBSAN: all instrumented suites passed =="
 
 # Per-module modem-layer oracle matrix (grows with the spandsp replacement).
 check-modem: tests/nf_modemtest
@@ -291,8 +324,8 @@ check-color: tests/nf_colortest tests/nf_xfer
 # T.38 terminal mode, nf<->nf over an in-process UDPTL pipe (our own UDPTL + IFP
 # codec; no spandsp). Non-ECM and ECM, clean and with injected UDPTL packet loss
 # (recovered by redundancy). Pixel-exact.
-tests/nf_t38loop: tests/nf_t38loop.c nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c
-	$(CC) $(CFLAGS) -I. -o $@ tests/nf_t38loop.c nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c $(LDLIBS)
+tests/nf_t38loop: tests/nf_t38loop.c $(ENGINE_SRCS)
+	$(CC) $(CFLAGS) -I. -o $@ tests/nf_t38loop.c $(ENGINE_SRCS) $(LDLIBS)
 
 tests/nf_udptltest: tests/nf_udptltest.c nf_udptl.c nf_udptl.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/nf_udptltest.c nf_udptl.c
@@ -301,15 +334,15 @@ tests/nf_udptltest: tests/nf_udptltest.c nf_udptl.c nf_udptl.h
 # an in-process UDPTL bridge, both directions (we send / we receive). Proves our
 # IFP/UDPTL output is decodable by a genuine T.38 stack and vice-versa. spandsp
 # is linked here as a test oracle only.
-tests/nf_t38oracle: tests/nf_t38oracle.c nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c
-	$(CC) $(CFLAGS) $(SPANDSP_CFLAGS) -I. -o $@ tests/nf_t38oracle.c nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c $(SPANDSP_LIBS) $(LDLIBS)
+tests/nf_t38oracle: tests/nf_t38oracle.c $(ENGINE_SRCS)
+	$(CC) $(CFLAGS) $(SPANDSP_CFLAGS) -I. -o $@ tests/nf_t38oracle.c $(ENGINE_SRCS) $(SPANDSP_LIBS) $(LDLIBS)
 
 # nf_t38gw : our nf_t30 T.38 sender -> spandsp t38_gateway (T.38<->audio re-modulation,
 # exactly what a carrier gateway does) -> spandsp audio fax receiver. This exercises the
 # re-modulation path that a plain T.38 terminal can't (training length, carrier drain,
 # HDLC pacing). spandsp linked as oracle only.
-tests/nf_t38gw: tests/nf_t38gw.c nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c
-	$(CC) $(CFLAGS) $(SPANDSP_CFLAGS) -I. -o $@ tests/nf_t38gw.c nf_t30.c nf_t38.c nf_udptl.c nf_fax.c nf_v8.c nf_v34.c nf_t4.c nf_color.c nf_dsp.c nf_hdlc.c nf_v21.c nf_qam.c nf_v29.c nf_v27.c nf_v17.c $(SPANDSP_LIBS) $(LDLIBS)
+tests/nf_t38gw: tests/nf_t38gw.c $(ENGINE_SRCS)
+	$(CC) $(CFLAGS) $(SPANDSP_CFLAGS) -I. -o $@ tests/nf_t38gw.c $(ENGINE_SRCS) $(SPANDSP_LIBS) $(LDLIBS)
 
 check-t38: tests/nf_udptltest tests/nf_t38loop
 	@convert doc.pam -threshold 50% -density 204x196 -units PixelsPerInch -compress group4 _t.tiff 2>/dev/null
@@ -356,7 +389,7 @@ clean:
 	      tests/nf_t4check tests/nf_faxloop tests/nf_faxloop2 tests/nf_interop \
 	      tests/nf_ecmtest tests/nf_ctctest tests/nf_modemtest tests/nf_colortest tests/nf_xfer \
 	      tests/nf_t38loop tests/nf_udptltest tests/nf_t38oracle tests/nf_t38gw \
-	      tests/nf_v34test tests/nf_v34fax tests/nf_v8test \
+	      tests/nf_v34test tests/nf_v34fax tests/nf_v8test tests/nf_md5test \
 	      _*.tiff _*.log _*.bin
 
-.PHONY: clean check check-fax check-ecm check-ctc check-color check-modem check-t38 check-t38-interop check-t38-gateway check-v8 check-v34 check-v34fax check-v34app
+.PHONY: clean check check-md5 asan check-fax check-ecm check-ctc check-color check-modem check-t38 check-t38-interop check-t38-gateway check-v8 check-v34 check-v34fax check-v34app

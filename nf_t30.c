@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "nf_t30.h"
+#include "nf_wire.h"
 #include "nf_fax.h"
 #include "nf_v8.h"
 #include "nf_t38.h"
@@ -17,35 +18,7 @@
  * machine. Owns an nf_fax driver and runs a page through nf_t4 + libtiff.
  */
 
-#define ADDR            0xFF
-#define CTL_FINAL       0x13
-#define CTL_NONFINAL    0x03
-
-/* FCF base values (t30_fcf.h). Dispatch is on (fcf | 0x01) to ignore the X bit. */
-#define FCF_DIS 0x80
-#define FCF_DCS 0x82
-#define FCF_CSI 0x40
-#define FCF_CIG 0x41     /* calling subscriber id (before DTC, polling)      */
-#define FCF_TSI 0x42
-#define FCF_CFR 0x84
-#define FCF_FTT 0x44
-#define FCF_MCF 0x8C
-#define FCF_RTP 0xCC     /* retrain positive: page OK, but retrain          */
-#define FCF_RTN 0x4C     /* retrain negative: page rejected, retransmit     */
-#define FCF_EOP 0x2E
-#define FCF_MPS 0x4E
-#define FCF_EOM 0x8E
-#define FCF_DCN 0xFA
-/* ECM (T.30 Annex A) */
-#define FCF_PPS 0xBE     /* partial page signal                       */
-#define FCF_PPR 0xBC     /* partial page request (32-octet frame map) */
-#define FCF_RNR 0xEC     /* receiver not ready                        */
-#define FCF_RR  0x6E     /* receiver ready                            */
-#define FCF_CTC 0x12     /* continue to correct                       */
-#define FCF_CTR 0xC4     /* response to CTC                           */
-#define FCF_EOR 0xCE     /* end of retransmission                     */
-#define FCF_ERR 0x1C     /* response to EOR                           */
-#define FCF_NULL 0x00
+/* ADDR/CTL, the FCF codes and T30_INFO_OFF live in the shared wire header. */
 #define T4_FCD  0x06     /* facsimile coded data (high-speed HDLC)    */
 #define T4_RCP  0x86     /* return to control for partial page        */
 #define ECM_OCTETS 256   /* octets of image data per FCD frame        */
@@ -62,11 +35,11 @@
 #define DISBIT5 0x10
 #define DISBIT6 0x20
 
-#define set_bit(f,b)      ((f)[3 + ((b)-1)/8] |= (uint8_t)(1u << (((b)-1)%8)))
-#define set_bits(f,v,b)   ((f)[3 + ((b)-1)/8] |= (uint8_t)((v) << (((b)-1)%8)))
+#define set_bit(f,b)      ((f)[T30_INFO_OFF + ((b)-1)/8] |= (uint8_t)(1u << (((b)-1)%8)))
+#define set_bits(f,v,b)   ((f)[T30_INFO_OFF + ((b)-1)/8] |= (uint8_t)((v) << (((b)-1)%8)))
 static int test_bit(const uint8_t *f, int len, int b)
 {
-    int idx = 3 + (b - 1) / 8;
+    int idx = T30_INFO_OFF + (b - 1) / 8;
     if (idx >= len) return 0;
     return (f[idx] >> ((b - 1) % 8)) & 1;
 }
@@ -205,7 +178,7 @@ struct nf_t30 {
     TIFF *tif_out;
     uint8_t *rxbuf; size_t rxcap, rxbits;           /* accumulated image bits   */
     nf_t4_dec_t *dec;
-    uint8_t *rxrows; int rxrow_n, rxrow_cap, rxstride;
+    uint8_t *rxrows; int rxrow_n, rxstride; size_t rxrows_bytes;
 
     /* TCF */
     int tcf_left;                  /* tx */
@@ -243,7 +216,7 @@ struct nf_t30 {
     int  last_resp_fcf;           /* rx: last post-message response sent (MCF/RTN) */
     int  reack_return;            /* substate to resume after an A_REACK re-send   */
     int  last_pps_fcf2;           /* rx: post-message in the last PPS             */
-    uint8_t ecm_map[3 + 32];      /* PPR frame-map scratch                        */
+    uint8_t ecm_map[T30_INFO_OFF + 32];      /* PPR frame-map scratch                        */
     size_t rx_ecm_len;            /* rx: accumulated image bytes for current page */
     /* fault injection (testing): drop a frame once on first (re)transmit/receipt */
     int  drop_tx[64], n_drop_tx;
@@ -373,9 +346,9 @@ static int build_id_frame(nf_t30_t *s, int fcf, uint8_t *out)
     int idl = (int) strlen(s->ident);
     if (idl > 20) idl = 20;
     for (int i = 0; i < idl; i++)
-        out[3 + i] = (uint8_t) s->ident[idl - 1 - i];   /* reversed */
-    memset(out + 3 + idl, ' ', (size_t)(20 - idl));
-    return 3 + 20;
+        out[T30_INFO_OFF + i] = (uint8_t) s->ident[idl - 1 - i];   /* reversed */
+    memset(out + T30_INFO_OFF + idl, ' ', (size_t)(20 - idl));
+    return T30_INFO_OFF + 20;
 }
 
 /* Send a phase-B control frame (DIS/DCS/DTC), prefixing our station-id frame
@@ -505,6 +478,21 @@ static int res_width(int nf_res)
 
 /* ── DIS / DCS build ───────────────────────────────────────────────── */
 
+/* Finish a DIS/DCS/DTC frame: mask off the trailing all-zero octets (the
+ * information field spans octets 6..18), then set the extension bit (0x80) on
+ * every remaining octet except the last. Returns the trimmed frame length.
+ * Shared verbatim by build_dis and build_dcs; returns the length rather than
+ * writing it, so each caller stores it in its own field. */
+static int trim_and_set_ext_bits(uint8_t *f)
+{
+    int i;
+    for (i = 18; i >= 6; i--) { f[i] &= 0x7F; if (f[i]) break; }
+    int len = i + 1;
+    f[i] &= 0x7F;
+    for (i--; i > 4; i--) f[i] |= 0x80;
+    return len;
+}
+
 static void build_dis(nf_t30_t *s)
 {
     uint8_t *f = s->local_dis;
@@ -540,12 +528,7 @@ static void build_dis(nf_t30_t *s)
     }
     if (s->want_ecm && s->file_capable)   /* binary file transfer (private profile) */
         set_bit(f, 53);                   /* BFT capable */
-    /* prune: trim trailing empty octets and set extension bits */
-    int i;
-    for (i = 18; i >= 6; i--) { f[i] &= 0x7F; if (f[i]) break; }
-    s->local_dis_len = i + 1;
-    f[i] &= 0x7F;
-    for (i--; i > 4; i--) f[i] |= 0x80;
+    s->local_dis_len = trim_and_set_ext_bits(f);
 }
 
 static void build_dcs(nf_t30_t *s)
@@ -579,11 +562,7 @@ static void build_dcs(nf_t30_t *s)
         int b = res_dis_bit(s->nf_res);
         if (b) set_bit(f, b);
     }
-    int i;
-    for (i = 18; i >= 6; i--) { f[i] &= 0x7F; if (f[i]) break; }
-    s->dcs_len = i + 1;
-    f[i] &= 0x7F;
-    for (i--; i > 4; i--) f[i] |= 0x80;
+    s->dcs_len = trim_and_set_ext_bits(f);
 }
 
 /* ── tx document (caller) ──────────────────────────────────────────── */
@@ -733,12 +712,18 @@ static void rx_row(void *user, const uint8_t *rowp, int width)
     nf_t30_t *s = user;
     s->rxstride = (width + 7) / 8;
     if ((size_t) s->rxrow_n * s->rxstride >= NF_RX_MAX_PAGE) return;   /* cap */
-    if (s->rxrow_n >= s->rxrow_cap) {
-        int ncap = s->rxrow_cap ? s->rxrow_cap * 2 : 256;
-        uint8_t *nb = realloc(s->rxrows, (size_t) ncap * s->rxstride);
+    /* Grow by BYTES, not row count. The per-row stride can increase between
+     * pages (a higher-resolution page after EOM renegotiation) while rxrow_n
+     * resets to 0 but the buffer keeps the previous page's smaller allocation;
+     * a row-count guard would then let the wider rows overrun it. */
+    size_t need = (size_t) (s->rxrow_n + 1) * s->rxstride;
+    if (need > s->rxrows_bytes) {
+        size_t ncap = s->rxrows_bytes ? s->rxrows_bytes : (size_t) 256 * s->rxstride;
+        while (ncap < need) ncap *= 2;
+        uint8_t *nb = realloc(s->rxrows, ncap);
         if (!nb) return;                    /* OOM: keep the old buffer, drop row */
         s->rxrows = nb;
-        s->rxrow_cap = ncap;
+        s->rxrows_bytes = ncap;
     }
     memcpy(s->rxrows + (size_t) s->rxrow_n * s->rxstride, rowp, s->rxstride);
     s->rxrow_n++;
@@ -888,12 +873,12 @@ static void log_nsf(nf_t30_t *s, const uint8_t *msg, int len)
 {
     if (!s->verbose || len < 4) return;
     char hex[3 * 16 + 1];
-    int p = 0, fl = len - 3;
+    int p = 0, fl = len - T30_INFO_OFF;
     if (fl > 16) fl = 16;
     for (int i = 0; i < fl; i++)
-        p += snprintf(hex + p, sizeof hex - (size_t) p, "%02x ", msg[3 + i]);
+        p += snprintf(hex + p, sizeof hex - (size_t) p, "%02x ", msg[T30_INFO_OFF + i]);
     vlog(s, "peer non-standard frame fcf=0x%02x country=0x%02x fif=%s%s",
-         msg[2], msg[3], hex, (len - 3 > 16) ? "..." : "");
+         msg[2], msg[T30_INFO_OFF], hex, (len - T30_INFO_OFF > 16) ? "..." : "");
 }
 
 static void parse_dcs(nf_t30_t *s, const uint8_t *msg, int len)
@@ -1198,12 +1183,12 @@ static void ecm_send_pps(nf_t30_t *s)
 /* Sender got a PPR: clear frames the receiver is happy with, keep the rest to resend. */
 static void ecm_apply_ppr(nf_t30_t *s, const uint8_t *msg, int len)
 {
-    if (len < 3 + 32) return;
+    if (len < T30_INFO_OFF + 32) return;
     for (int i = 0; i < 32; i++)
         for (int j = 0; j < 8; j++) {
             int fno = (i << 3) + j;
             if (fno >= s->ecm_frames) continue;
-            s->ecm_send[fno] = (msg[3 + i] >> j) & 1;          /* bit set -> resend */
+            s->ecm_send[fno] = (msg[T30_INFO_OFF + i] >> j) & 1;          /* bit set -> resend */
         }
 }
 
@@ -1276,7 +1261,7 @@ static void ecm_rx_listen(nf_t30_t *s)   /* receive FCD/RCP over the fast modem 
 
 static void ecm_store_fcd(nf_t30_t *s, const uint8_t *msg, int len)
 {
-    int fno = msg[3];
+    int fno = msg[T30_INFO_OFF];
     int plen = len - 4;
     if (fno < 0 || fno > 255 || plen < 0) return;
     if (plen > ECM_OCTETS) plen = ECM_OCTETS;
@@ -1330,7 +1315,11 @@ static void write_rx_file(nf_t30_t *s)
     uint64_t len = 0;
     for (int i = 0; i < 8; i++) len |= (uint64_t) b[6 + nl + i] << (8 * i);
     size_t off = (size_t) 6 + nl + 8;
-    if (off + len > n) len = n - off;            /* clamp to what we actually have */
+    /* off <= n is guaranteed by the header check above. Compare as len > n-off
+     * rather than off+len > n: the latter overflows uint64 for a hostile length
+     * field (~2^64) and the clamp would never fire, so fwrite would read far
+     * past the end of the reassembled buffer. */
+    if (len > (uint64_t) (n - off)) len = n - off;   /* clamp to what we have */
     char name[256]; int cn = nl < 255 ? nl : 255;
     memcpy(name, b + 6, cn); name[cn] = '\0';
     FILE *f = fopen(s->rx_file, "wb");
@@ -1385,10 +1374,10 @@ static void ecm_send_ppr(nf_t30_t *s)
         uint8_t b = 0;
         for (int j = 0; j < 8; j++)
             if (s->ecm_len[(i << 3) + j] < 0) b |= (uint8_t) (1u << j);   /* missing */
-        m[3 + i] = b;
+        m[T30_INFO_OFF + i] = b;
     }
     tx_v21_frames(s);
-    s->mops->send_hdlc(s->be, m, 3 + 32);
+    s->mops->send_hdlc(s->be, m, T30_INFO_OFF + 32);
     s->substate = A_SEND_PPR;
 }
 
@@ -1407,7 +1396,7 @@ static void reack(nf_t30_t *s, int resume)
 static void ecm_process_pps(nf_t30_t *s, const uint8_t *msg, int len)
 {
     if (len < 7) return;
-    int fcf2 = msg[3] & 0xFE;
+    int fcf2 = msg[T30_INFO_OFF] & 0xFE;
     int frames = msg[6] + 1;
     int page = msg[4], block = msg[5];
 
@@ -1487,16 +1476,16 @@ static void ecm_process_eor(nf_t30_t *s, const uint8_t *msg, int len)
  * octets back-to-front and trim surrounding spaces. Mirrors into the stats. */
 static void capture_far_ident(nf_t30_t *s, const uint8_t *msg, int len)
 {
-    int fl = len - 3;
+    int fl = len - T30_INFO_OFF;
     if (fl < 0) fl = 0;
     if (fl > 20) fl = 20;
     /* un-reverse: last FIF octet is the first id character */
     int start = 0, end = fl;
-    while (start < end && msg[3 + start] == ' ') start++;      /* trailing pad */
-    while (end > start && msg[3 + end - 1] == ' ') end--;      /* leading pad  */
+    while (start < end && msg[T30_INFO_OFF + start] == ' ') start++;      /* trailing pad */
+    while (end > start && msg[T30_INFO_OFF + end - 1] == ' ') end--;      /* leading pad  */
     int n = 0;
     for (int i = end - 1; i >= start && n < (int) sizeof s->far_ident - 1; i--)
-        s->far_ident[n++] = (char) msg[3 + i];
+        s->far_ident[n++] = (char) msg[T30_INFO_OFF + i];
     s->far_ident[n] = '\0';
     memcpy(s->stats.rx_ident, s->far_ident, sizeof s->stats.rx_ident);
     vlog(s, "remote station id: \"%s\"", s->far_ident);
@@ -1896,6 +1885,7 @@ static void on_status(void *user, int status)
                 start_rx_page(s);
                 rx_image(s, 1); s->substate = A_RECV_IMAGE;   /* next page, same params */
             } else if (s->last_post_fcf == FCF_EOM) {
+                s->dis_retries = 0;                            /* fresh cycle: new DIS budget */
                 answer_send_dis(s);                            /* renegotiate (Phase B) */
             } else {
                 rx_v21(s); arm_timeout(s, 7000); s->substate = A_WAIT_DCN;
@@ -1918,15 +1908,14 @@ static void on_status(void *user, int status)
             } else {
                 ecm_finish_page(s);
                 if (s->last_pps_fcf2 == FCF_MPS)      { ecm_rx_begin_page(s); ecm_rx_listen(s); }
-                else if (s->last_pps_fcf2 == FCF_EOM) { answer_send_dis(s); }
+                else if (s->last_pps_fcf2 == FCF_EOM) { s->dis_retries = 0; answer_send_dis(s); }
                 else { rx_v21(s); arm_timeout(s, 7000); s->substate = A_WAIT_DCN; }  /* EOP */
             }
             break;
         case A_REACK:                    /* a repeated command was re-acknowledged */
             if (s->reack_return == A_RECV_ECM)
                 ecm_rx_listen(s);                       /* resume receiving the block */
-            else
-                { rx_v21(s); arm_timeout(s, 7000); s->substate = A_WAIT_DCN; }
+            else { rx_v21(s); arm_timeout(s, 7000); s->substate = A_WAIT_DCN; }
             break;
         }
         return;

@@ -1,10 +1,17 @@
 #include "nf_dsp.h"
 #include <math.h>
+#include <stdlib.h>
 
 /*
  * Shared DSP support. See nf_dsp.h for the level conventions (they mirror
  * spandsp: full-scale sine = +3.14 dBm0, power meter in (amp^2) units).
  */
+
+int nf_cached_env_flag(int *cache, const char *envvar)
+{
+    if (*cache < 0) { const char *e = getenv(envvar); *cache = (e && *e) ? 1 : 0; }
+    return *cache;
+}
 
 #define NF_SINE_BITS  12
 #define NF_SINE_LEN   (1 << NF_SINE_BITS)

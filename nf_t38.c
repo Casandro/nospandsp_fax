@@ -1,5 +1,7 @@
 #include "nf_t38.h"
 #include "nf_udptl.h"
+#include "nf_dsp.h"        /* nf_cached_env_flag */
+#include "nf_wire.h"       /* FCF_MCF */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -8,8 +10,7 @@
 static int t38dbg(void)
 {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("NF_T38_DBG"); v = (e && *e) ? 1 : 0; }
-    return v;
+    return nf_cached_env_flag(&v, "NF_T38_DBG");
 }
 static const char *ind_name(int i)
 {
@@ -50,6 +51,12 @@ enum {
     TX_HDLC_END, TX_NONECM, TX_NONECM_TRAIL, TX_NONECM_END,
     TX_TONE_WAIT, TX_PAUSE_WAIT, TX_COMPLETE
 };
+
+/* What the current indicator burst is followed by (the value of tx_follow).
+ * The non-negative values ARE the "carrier carries HDLC?" flag straight from
+ * set_tx_type (0 = non-ECM image data, 1 = HDLC control/ECM); the negatives
+ * mark bursts that have no data phase at all. */
+enum { TX_FOLLOW_TONE = -2, TX_FOLLOW_NONE = -1, TX_FOLLOW_NONECM = 0, TX_FOLLOW_HDLC = 1 };
 
 /* ITU-T T.38 §9: indicators are not covered by the UDPTL redundancy that
  * protects data fields, so each is sent several times to survive packet loss and
@@ -98,7 +105,7 @@ struct nf_t38 {
     int  red_hs;            /* UDPTL redundancy for high-speed image data (non-ECM/
                              * ECM); non-ECM has no retransmission, so loss here is
                              * unrecoverable within the page                        */
-    int  tx_is_hdlc;        /* current carrier carries HDLC              */
+    int  tx_follow;         /* what follows the current indicator: TX_FOLLOW_* */
     int  tx_is_stream;      /* ECM: pull frames via up.hdlc_get_frame    */
     int  tx_wait_ms;        /* remaining delay for tone/pause phases     */
     uint8_t tx_frame[600];  /* current HDLC frame, bit-reversed for the wire */
@@ -238,7 +245,7 @@ static void t38_set_tx_type(void *be, int type, int rate, int short_train, int u
     s->tx_ind = ind;
     s->tx_dt = dt;
     s->tx_bit_rate = rate > 0 ? rate : 14400;
-    s->tx_is_hdlc = use_hdlc;
+    s->tx_follow = use_hdlc;        /* 0/1 -> TX_FOLLOW_NONECM/TX_FOLLOW_HDLC */
     s->tx_is_stream = 0;
     s->tx_have_frame = 0;
     s->tx_trailer = 0;
@@ -251,7 +258,7 @@ static void t38_set_tx_type(void *be, int type, int rate, int short_train, int u
         /* No carrier: announce no-signal, no completion step expected. */
         s->tx_ind = IND_NO_SIGNAL;
         s->tx_phase = TX_IND;
-        s->tx_is_hdlc = -1;             /* -> go idle after the indicator */
+        s->tx_follow = TX_FOLLOW_NONE;  /* -> go idle after the indicator */
         break;
     case NF_MODEM_PAUSE:
         s->tx_wait_ms = rate > 0 ? rate : short_train;   /* ms in short_train arg */
@@ -262,7 +269,7 @@ static void t38_set_tx_type(void *be, int type, int rate, int short_train, int u
     case NF_MODEM_CNG:
         s->tx_wait_ms = 200;
         s->tx_phase = TX_IND;           /* emit tone indicator, then wait+complete */
-        s->tx_is_hdlc = -2;             /* tone marker */
+        s->tx_follow = TX_FOLLOW_TONE;  /* tone marker */
         break;
     default:
         s->tx_phase = TX_IND;           /* emit training/preamble, then data */
@@ -291,7 +298,7 @@ static void t38_send_hdlc(void *be, const uint8_t *msg, int len)
     /* Test hook: NF_T38_DROP_MCF=N drops the next N MCF responses on the wire
      * (state still advances), to exercise the sender's command retransmit and
      * the receiver's re-acknowledge recovery. */
-    if (len >= 3 && (msg[2] & 0xFE) == 0x8C /* FCF_MCF */) {
+    if (len >= 3 && (msg[2] & 0xFE) == FCF_MCF) {
         static int mcf_drop = -1;
         if (mcf_drop < 0) { const char *e = getenv("NF_T38_DROP_MCF"); mcf_drop = e ? atoi(e) : 0; }
         if (mcf_drop > 0) { mcf_drop--; s->tx_suppress = 1; }
@@ -343,14 +350,14 @@ void nf_t38_pump(nf_t38_t *s, int ms)
     case TX_IND:
         emit_indicator(s, s->tx_ind);
         if (s->tx_ind_left > 0) { s->tx_ind_left--; break; }  /* T.38 §9: repeat, then proceed */
-        if (s->tx_is_hdlc == -1) {           /* NO_SIGNAL: nothing follows */
+        if (s->tx_follow == TX_FOLLOW_NONE) {    /* NO_SIGNAL: nothing follows */
             s->tx_phase = TX_IDLE;
-        } else if (s->tx_is_hdlc == -2) {    /* CED/CNG tone */
+        } else if (s->tx_follow == TX_FOLLOW_TONE) {   /* CED/CNG tone */
             s->tx_phase = TX_TONE_WAIT;
         } else {
             /* Decide what follows the indicator, but first allow the training /
              * flag-preamble time so a gateway can play it out. */
-            s->tx_next_phase = s->tx_is_hdlc
+            s->tx_next_phase = (s->tx_follow == TX_FOLLOW_HDLC)
                 ? (s->tx_is_stream ? TX_HDLC_DATA
                                    : (s->tx_have_frame ? TX_HDLC_DATA : TX_HDLC_END))
                 : TX_NONECM;

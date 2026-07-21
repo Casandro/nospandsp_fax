@@ -12,7 +12,7 @@
 #include <string.h>
 #include <stdio.h>
 
-static int nffax_dbg(void) { static int d = -1; if (d < 0) d = getenv("NFFAXDBG") ? 1 : 0; return d; }
+static int nffax_dbg(void) { static int d = -1; return nf_cached_env_flag(&d, "NFFAXDBG"); }
 #define DBG(...) do { if (nffax_dbg()) fprintf(stderr, "  <fax> " __VA_ARGS__); } while (0)
 
 /*
@@ -697,8 +697,8 @@ int nf_fax_tx(nf_fax_t *s, int16_t *amp, int max_len)
     int len = 0;
     if (s->transmit) {
         while ((len += s->tx_handler(s->tx_user, amp + len, max_len - len)) < max_len) {
-            if (advance_tx(s) && s->current_tx_type != NF_MODEM_NONE
-                              && s->current_tx_type != NF_MODEM_DONE)
+            if (advance_tx(s) < 0 && s->current_tx_type != NF_MODEM_NONE
+                                  && s->current_tx_type != NF_MODEM_DONE)
                 emit_status(s, NF_STATUS_SEND_STEP_COMPLETE);
             if (!s->transmit) {
                 if (s->transmit_on_idle) {

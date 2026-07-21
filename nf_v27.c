@@ -70,12 +70,6 @@ static void make_tables(void)
 
 /* ── tx ────────────────────────────────────────────────────────────── */
 
-static int fake_get_bit(void *user)
-{
-    (void) user;
-    return 1;
-}
-
 static int v27_scramble(nf_v27_tx_t *s, int in_bit)
 {
     int out = (in_bit ^ (s->scramble_reg >> 5) ^ (s->scramble_reg >> 6)) & 1;
@@ -98,7 +92,7 @@ static int get_scrambled_bit(nf_v27_tx_t *s)
 {
     int bit = s->current_get_bit(s->current_user);
     if (bit < 0) {
-        s->current_get_bit = fake_get_bit;
+        s->current_get_bit = nf_fake_get_bit;
         s->current_user = NULL;
         s->in_training = 1;
         bit = 1;
@@ -162,7 +156,7 @@ int nf_v27_tx_restart(nf_v27_tx_t *s, int bit_rate)
     s->in_training = 1;
     s->training_step = SEG_2;           /* no TEP */
     s->constellation_state = 0;
-    s->current_get_bit = fake_get_bit;
+    s->current_get_bit = nf_fake_get_bit;
     s->current_user = NULL;
     if (bit_rate == 4800)
         nf_qam_tx_init(&s->qam, tx_shaper_4800, TX_SETS_4800, TX_TAPS, 1,

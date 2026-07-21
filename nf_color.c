@@ -132,6 +132,10 @@ static int jpeg_compress(const uint8_t *samples, int w, int h, int comps,
 {
     struct jpeg_compress_struct cinfo;
     struct nf_jerr jerr;
+    /* Not volatile despite being freed in the longjmp handler: its address is
+     * passed to jpeg_mem_dest (which needs unsigned char **), so it is forced
+     * to memory and reloaded after longjmp — the indeterminate-value hazard
+     * that requires `volatile` for `buf` in jpeg_decompress does not apply. */
     unsigned char *mem = NULL;
     unsigned long memlen = 0;
 
@@ -181,7 +185,11 @@ static int jpeg_decompress(const uint8_t *bytes, size_t len, int want_comps,
 {
     struct jpeg_decompress_struct dinfo;
     struct nf_jerr jerr;
-    uint8_t *buf = NULL;
+    /* volatile: buf is assigned after setjmp and freed in the longjmp handler.
+     * A non-volatile local modified between setjmp/longjmp is indeterminate on
+     * return (C11 §7.13.2.1p3); without this the handler could free a stale
+     * register value (leak, or invalid free) on a corrupt JPEG over ECM. */
+    uint8_t * volatile buf = NULL;
 
     dinfo.err = jpeg_std_error(&jerr.pub);
     jerr.pub.error_exit = nf_jpeg_error_exit;

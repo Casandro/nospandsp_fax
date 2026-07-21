@@ -192,12 +192,6 @@ static void rate_params(int bit_rate, int *bits_per_symbol, int *space_map,
 
 /* ── tx ────────────────────────────────────────────────────────────── */
 
-static int fake_get_bit(void *user)
-{
-    (void) user;
-    return 1;
-}
-
 static int v17_scramble(uint32_t *reg, int in_bit)
 {
     int out = (in_bit ^ (*reg >> 17) ^ (*reg >> 22)) & 1;
@@ -278,7 +272,7 @@ static nf_cpx_t v17_getbaud(void *user)
         int bit = s->current_get_bit(s->current_user);
         if (bit < 0) {
             /* end of real data: shut down on scrambled ones */
-            s->current_get_bit = fake_get_bit;
+            s->current_get_bit = nf_fake_get_bit;
             s->current_user = NULL;
             s->in_training = 1;
             bit = 1;
@@ -307,7 +301,7 @@ int nf_v17_tx_restart(nf_v17_tx_t *s, int bit_rate, int short_train)
     s->short_train = short_train;
     s->training_step = SEG_1;           /* no TEP */
     s->constellation_state = 0;
-    s->current_get_bit = fake_get_bit;
+    s->current_get_bit = nf_fake_get_bit;
     s->current_user = NULL;
     /* the constellation design keeps the average power constant per rate;
      * the 0.70711 calibrates our unit-DC-gain RRC tables to spandsp's

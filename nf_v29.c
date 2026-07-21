@@ -104,17 +104,11 @@ static void make_tables(void)
 
 /* ── tx ────────────────────────────────────────────────────────────── */
 
-static int fake_get_bit(void *user)
-{
-    (void) user;
-    return 1;
-}
-
 static int get_scrambled_bit(nf_v29_tx_t *s)
 {
     int bit = s->current_get_bit(s->current_user);
     if (bit < 0) {                  /* end of real data: shut down on ones */
-        s->current_get_bit = fake_get_bit;
+        s->current_get_bit = nf_fake_get_bit;
         s->current_user = NULL;
         s->in_training = 1;
         bit = 1;
@@ -196,7 +190,7 @@ int nf_v29_tx_restart(nf_v29_tx_t *s, int bit_rate)
     s->in_training = 1;
     s->training_step = 0;
     s->constellation_state = 0;
-    s->current_get_bit = fake_get_bit;
+    s->current_get_bit = nf_fake_get_bit;
     s->current_user = NULL;
     nf_qam_tx_restart(&s->qam, v29_tx_gain(bit_rate));
     return 0;

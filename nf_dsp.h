@@ -22,14 +22,22 @@ enum {
     NF_SIG_TRAINING_IN_PROGRESS = -3,
     NF_SIG_TRAINING_SUCCEEDED   = -4,
     NF_SIG_TRAINING_FAILED      = -5,
+    /* nf_hdlc reports rx framing-OK as -6 and rx aborts as -8, matching
+     * spandsp's SIG_STATUS_FRAMING_OK / SIG_STATUS_ABORT, through the same
+     * status plumbing */
+    NF_SIG_FRAMING_OK           = -6,
     NF_SIG_END_OF_DATA          = -7,
-    /* -8 is taken: nf_hdlc reports rx aborts as -8 (spandsp's
-     * SIG_STATUS_ABORT) through the same status plumbing */
+    NF_SIG_ABORT                = -8,
     /* a queued tx data section finished going out while the carrier stays up
      * (the V.34 control channel holds flags between frames, so there is no
      * "burst ended" moment to infer completion from) */
     NF_SIG_SEND_COMPLETE        = -9
 };
+
+/* Lazily read a boolean flag from an environment variable and cache it.
+ * *cache must start < 0; the variable counts as "on" only when set and
+ * non-empty. Backs the per-module debug-trace switches (nf_fax, nf_t38). */
+int nf_cached_env_flag(int *cache, const char *envvar);
 
 /* ── complex float ─────────────────────────────────────────────────── */
 

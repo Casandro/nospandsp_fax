@@ -308,7 +308,6 @@ struct nf_t4_dec {
     const uint8_t *data; size_t len; size_t bitpos;   /* set per put() call */
     uint8_t *row;                                      /* current decoded row */
     uint32_t *ref; int ref_n;                          /* reference transitions */
-    uint32_t *cur;                                     /* scratch for next ref */
     uint8_t *good_row;                                 /* last good row (concealment) */
     int rows;
     int bad_rows;
@@ -359,6 +358,11 @@ static int read_run(nf_t4_dec_t *d, int black)
         r = read_code(d, tab);
         if (r < 0) return -1;
         total += r;
+        /* Saturate. A crafted stream of nothing but make-up codes would grow
+         * total without bound and eventually wrap negative; the cap is far
+         * above any legal run (max line width 3456) so valid input is never
+         * affected, and the caller clamps to the line width regardless. */
+        if (total > (1 << 20)) total = 1 << 20;
     } while (r >= 64);
     return total;
 }
@@ -485,9 +489,8 @@ nf_t4_dec_t *nf_t4_dec_init(int width, int compression,
     d->cb = row_handler; d->cb_user = user_data;
     d->row = malloc((size_t) ((width + 7) / 8));
     d->ref = malloc((size_t) (width + 4) * sizeof(uint32_t));
-    d->cur = malloc((size_t) (width + 4) * sizeof(uint32_t));
     d->good_row = calloc(1, (size_t) ((width + 7) / 8));   /* starts white */
-    if (!d->row || !d->ref || !d->cur || !d->good_row) { nf_t4_dec_free(d); return NULL; }
+    if (!d->row || !d->ref || !d->good_row) { nf_t4_dec_free(d); return NULL; }
     d->ref[0] = (uint32_t) width; d->ref_n = 1;      /* imaginary white reference line */
     return d;
 }
@@ -553,5 +556,5 @@ int nf_t4_dec_bad_rows(const nf_t4_dec_t *d) { return d->bad_rows; }
 void nf_t4_dec_free(nf_t4_dec_t *d)
 {
     if (!d) return;
-    free(d->row); free(d->good_row); free(d->ref); free(d->cur); free(d);
+    free(d->row); free(d->good_row); free(d->ref); free(d);
 }

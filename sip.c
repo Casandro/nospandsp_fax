@@ -265,8 +265,21 @@ int sip_media_rx(sip_media_t *m, int16_t *pcm, int max)
     }
 
     if ((pkt[1] & 0x7F) != PCMA_PT) return 0;
+    /* Header = 12 + CSRC list; then, if the X bit is set, a 4-byte extension
+     * header plus its declared word count. Skipping these matters: without it
+     * a CSRC/extension header would be decoded as leading audio samples. */
     int hdr = 12 + (pkt[0] & 0x0F) * 4;
-    int n = (int)r - hdr;
+    if (pkt[0] & 0x10) {                         /* X: RTP extension present */
+        if (hdr + 4 > (int) r) return 0;
+        int extwords = (pkt[hdr + 2] << 8) | pkt[hdr + 3];
+        hdr += 4 + extwords * 4;
+    }
+    int n = (int) r - hdr;
+    if (n <= 0) return 0;
+    if (pkt[0] & 0x20) {                          /* P: trailing padding */
+        int pad = pkt[r - 1];                     /* last octet = pad length */
+        if (pad > 0 && pad <= n) n -= pad;
+    }
     if (n <= 0) return 0;
     if (n > max) n = max;
     for (int i = 0; i < n; i++)
@@ -528,6 +541,14 @@ static int qop_has_auth(const char *qop)
     return 0;
 }
 
+/* Output buffer size for a full Digest header. Must fit the longest header
+ * build_auth can emit: prefix + username(<=127) + realm(<=255) + nonce(<=255)
+ * + uri(<=599) + response(32) + cnonce(16) + opaque(<=191) + fixed text — under
+ * ~1600 bytes, so 2048 leaves headroom and can never snprintf-truncate (a
+ * truncated header would go on the wire malformed and auth would silently fail
+ * even against a well-behaved but verbose registrar). */
+#define SIP_AUTH_HDR_MAX 2048
+
 /* Build a Digest Authorization/Proxy-Authorization header into out. Uses
  * qop=auth (with a fresh cnonce and nc) when the challenge offers it - which
  * makes the response non-replayable and interoperable with modern servers -
@@ -604,7 +625,7 @@ static int do_register(sip_media_t *m, const sip_config_t *cfg,
         char uri[300];
         snprintf(uri, sizeof(uri), "sip:%s", cfg->registrar_host);
 
-        char auth[800] = "";
+        char auth[SIP_AUTH_HDR_MAX] = "";
         if (attempt == 1)
             build_auth(cfg->local_user, cfg->password, "REGISTER", uri,
                        realm, nonce, qop, opaque, 0, auth, sizeof(auth));
@@ -663,7 +684,7 @@ static int build_invite(sip_media_t *m, const sip_config_t *cfg,
                         const char *qop, const char *opaque, int proxy,
                         char *req, int cap)
 {
-    char auth[900] = "";
+    char auth[SIP_AUTH_HDR_MAX] = "";
     if (realm && realm[0] && nonce && nonce[0] && cfg->password[0])
         build_auth(cfg->local_user, cfg->password, "INVITE", target_uri,
                    realm, nonce, qop, opaque, proxy, auth, sizeof(auth));
@@ -825,6 +846,7 @@ static int uac_establish(const sip_config_t *cfg, sip_media_t *m)
 
     /* Bind the local SIP socket; its port appears in our Via/Contact. */
     m->sip_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (m->sip_sock < 0) { perror("socket SIP"); return -1; }
     struct sockaddr_in local;
     memset(&local, 0, sizeof(local));
     local.sin_family      = AF_INET;
@@ -832,6 +854,7 @@ static int uac_establish(const sip_config_t *cfg, sip_media_t *m)
     local.sin_port        = htons((uint16_t)cfg->local_sip_port);
     if (bind(m->sip_sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
         perror("bind SIP");
+        close(m->sip_sock); m->sip_sock = -1;
         return -1;
     }
 
@@ -900,6 +923,10 @@ static int uac_establish(const sip_config_t *cfg, sip_media_t *m)
             }
             return -1;
         }
+        /* wg: time left until Timer C / total giveup (computed just above).
+         * wt: time until the next scheduled event — the INVITE retransmit,
+         * or, once ringing (provisional), just wg since we stop retransmitting.
+         * wms: whichever comes sooner, clamped to >= 0, is how long we wait. */
         long wt = provisional ? wg : ts_until_ms(&next_tx);
         long wms = wt < wg ? wt : wg;
         if (wms < 0) wms = 0;
@@ -1141,6 +1168,7 @@ int sip_media_establish(const sip_config_t *cfg, sip_media_t *m)
 
     /* Answer mode: bind the SIP port, optionally register, await an INVITE. */
     m->sip_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (m->sip_sock < 0) { perror("socket SIP"); return -1; }
     struct sockaddr_in local;
     memset(&local, 0, sizeof(local));
     local.sin_family      = AF_INET;
@@ -1148,6 +1176,7 @@ int sip_media_establish(const sip_config_t *cfg, sip_media_t *m)
     local.sin_port        = htons((uint16_t)cfg->local_sip_port);
     if (bind(m->sip_sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
         perror("bind SIP");
+        close(m->sip_sock); m->sip_sock = -1;
         return -1;
     }
 
@@ -1431,7 +1460,7 @@ int sip_offer_t38(sip_media_t *m, const sip_config_t *cfg)
         int my_cseq = m->cseq++;
         char branch[20]; gen_branch(branch);
         char sdp[512]; int sdp_len = build_t38_sdp(m->local_ip, lp, sdp, sizeof(sdp));
-        char auth[900] = "";
+        char auth[SIP_AUTH_HDR_MAX] = "";
         if (attempt == 1 && realm[0] && cfg->password[0])
             build_auth(cfg->local_user, cfg->password, "INVITE", m->bye_ruri,
                        realm, nonce, qop, opaque, 0, auth, sizeof(auth));

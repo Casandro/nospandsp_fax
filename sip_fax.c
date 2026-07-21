@@ -1526,6 +1526,13 @@ static void daemon_accept(struct dcall *calls, sip_media_t *listen,
     if (pid == 0) {
         /* Child: keep only the media. Drop the listening socket + write end. */
         close(stop[1]);
+        /* Also drop the parent-side write ends of every OTHER active call that
+         * we inherited across the fork. If we kept them, (a) they leak, and
+         * (b) a sibling child's stop[0] would never see EOF when the parent
+         * dies, because this process would still hold a write end — defeating
+         * the orphan-detection that lets an abandoned child finalize. */
+        for (int i = 0; i < MAX_DCALLS; i++)
+            if (calls[i].active && calls[i].stop_w >= 0) close(calls[i].stop_w);
         if (listen->sip_sock >= 0) close(listen->sip_sock);
         call.sip_sock = -1;                 /* never touch SIP from the child */
         int rc = run_fax_media(&call, stop[0], tiff_path,
@@ -2032,9 +2039,13 @@ int main(int argc, char **argv)
     /* --send-alt / --send-color / --send-gray may be combined: the best kind
      * the receiver supports is chosen at phase B. Everything else stays
      * mutually exclusive. */
-    int tx_img_kinds = (altdoc.n_alt > 0) + !!send_color + !!send_gray;
-    if (!!send_file + !!recv_file + !!send_file_arg + !!recv_file_arg
-        + (tx_img_kinds > 0) != 1) {
+    int tx_img_kinds = (altdoc.n_alt > 0) + (send_color != NULL) + (send_gray != NULL);
+    /* Exactly one top-level mode must be selected: a file send/receive, a fax
+     * receive, or an image-sending combination (which tx_img_kinds folds to one). */
+    int kinds_set = (send_file != NULL) + (recv_file != NULL)
+                  + (send_file_arg != NULL) + (recv_file_arg != NULL)
+                  + (tx_img_kinds > 0);
+    if (kinds_set != 1) {
         fprintf(stderr, "error: specify exactly one of --send / --send-file / "
                 "--receive / --receive-file, or an image-sending combination of "
                 "--send-alt / --send-color / --send-gray\n");
@@ -2073,7 +2084,8 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    int n_transport = !!listen_port + !!connect_arg + !!sip_dial + !!sip_answer;
+    int n_transport = (listen_port != NULL) + (connect_arg != NULL)
+                    + (sip_dial != NULL) + (sip_answer != 0);
     if (n_transport != 1) {
         fprintf(stderr, "error: specify exactly one transport "
                 "(--listen / --connect / --sip-dial / --sip-answer)\n");

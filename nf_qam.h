@@ -28,6 +28,11 @@
  * the project's acceptance bar is parity with spandsp under line impairments.
  */
 
+/* A get_bit callback that always yields a 1 (idle/filler bits). The V.17,
+ * V.27ter and V.29 tx state machines all point current_get_bit at this during
+ * training and once a burst has ended; it was previously copy-pasted into each. */
+static inline int nf_fake_get_bit(void *user) { (void) user; return 1; }
+
 #define NF_QAM_MAX_TX_TAPS   9
 #define NF_QAM_MAX_TX_SETS   20
 #define NF_QAM_MAX_RX_TAPS   27

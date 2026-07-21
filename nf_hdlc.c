@@ -43,8 +43,8 @@ int nf_hdlc_tx_frame(nf_hdlc_tx_t *s, const uint8_t *buf, int len)
         s->tx_end = 1;
         return 0;
     }
-    if (len > NF_HDLC_MAXFRAME || s->nbytes)
-        return -1;                       /* lockout: one frame at a time */
+    if (len < 0 || len > NF_HDLC_MAXFRAME || s->nbytes)
+        return -1;                       /* reject junk / lockout: one frame at a time */
     memcpy(s->buf, buf, (size_t) len);
     uint16_t crc = nf_crc16(buf, len, 0xFFFF) ^ 0xFFFF;
     s->buf[len]     = (uint8_t) crc;
@@ -157,7 +157,7 @@ static void rx_flag_or_abort(nf_hdlc_rx_t *s)
 {
     if (s->raw & 0x0100) {
         /* abort: seven or more ones */
-        rx_status(s, -8 /* abort, same value as spandsp's SIG_STATUS_ABORT */);
+        rx_status(s, NF_SIG_ABORT);
         if (s->flags_seen < s->framing_ok_threshold - 1)
             s->flags_seen = 0;
         else
@@ -191,7 +191,7 @@ static void rx_flag_or_abort(nf_hdlc_rx_t *s)
             }
             if (++s->flags_seen >= s->framing_ok_threshold
                 && !s->framing_ok_announced) {
-                rx_status(s, -6 /* framing OK, spandsp's SIG_STATUS_FRAMING_OK */);
+                rx_status(s, NF_SIG_FRAMING_OK);
                 s->framing_ok_announced = 1;
             }
         }
