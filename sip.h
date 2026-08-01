@@ -2,6 +2,7 @@
 #define SIP_H
 
 #include <stdint.h>
+#include <sys/socket.h>
 #include <netinet/in.h>
 
 /*
@@ -48,11 +49,16 @@ typedef struct {
     int               rtp_sock;
     int               verbose;
 
-    char              local_ip[64];
+    int               af;              /* family of our sockets (AF_INET6 =
+                                        * dual-stack, v4 peers appear mapped;
+                                        * AF_INET on IPv6-less kernels)      */
+    char              local_ip[64];    /* numeric, unbracketed (SDP c= form) */
+    char              local_uri_host[72]; /* local_ip, [bracketed] if IPv6
+                                        * (Via sent-by / Contact URI form)   */
     char              local_user[128]; /* user part of our AoR (for Contact)  */
     int               local_sip_port;
-    struct sockaddr_in sip_peer;       /* where in-dialog requests are sent */
-    struct sockaddr_in remote_rtp;     /* negotiated media destination      */
+    struct sockaddr_storage sip_peer;  /* where in-dialog requests are sent */
+    struct sockaddr_storage remote_rtp;/* negotiated media destination      */
 
     /* RTP TX state (PCMA, PT 8, 8 kHz). */
     uint16_t          rtp_seq;
@@ -81,7 +87,7 @@ typedef struct {
     int               enable_t38;      /* offer/accept T.38 for this call    */
     int               t38_sock;        /* UDPTL socket, or -1                */
     int               t38_active;      /* media has switched to T.38         */
-    struct sockaddr_in t38_peer;       /* peer's UDPTL address               */
+    struct sockaddr_storage t38_peer;  /* peer's UDPTL address               */
     int               t38_latched;     /* symmetric UDPTL source adopted + locked */
     int               t38_far_datagram;/* peer's T38FaxMaxDatagram           */
 } sip_media_t;
@@ -118,10 +124,10 @@ int  sip_offer_t38(sip_media_t *m, const sip_config_t *cfg);
 /* Daemon UAS: accept an in-dialog T.38 re-INVITE on `dlg` (answers 200 with a
  * T.38 SDP, opens a UDPTL socket, records peer/far-datagram). Returns the UDPTL
  * fd to hand to the media child, or -1 if not an acceptable T.38 offer. */
-int  sip_t38_accept(sip_media_t *dlg, const char *req, struct sockaddr_in *from,
+int  sip_t38_accept(sip_media_t *dlg, const char *req, struct sockaddr_storage *from,
                     int *far_datagram, int *local_port);
 /* Re-answer a retransmitted (already-accepted) T.38 re-INVITE from the saved port. */
-void sip_t38_reanswer(sip_media_t *dlg, const char *req, struct sockaddr_in *from,
+void sip_t38_reanswer(sip_media_t *dlg, const char *req, struct sockaddr_storage *from,
                       int local_port);
 
 /* Tear the call down: send BYE (or 200 to a pending BYE) and close sockets. */
@@ -156,18 +162,18 @@ int  sip_daemon_register(sip_media_t *listen, const sip_config_t *cfg);
  * is the listen socket so the parent can answer in-dialog requests and BYE).
  * Returns 0 on success, -1 if the INVITE carries no usable PCMA SDP. */
 int  sip_uas_accept(const sip_config_t *cfg, sip_media_t *listen,
-                    const char *invite, struct sockaddr_in *from,
+                    const char *invite, struct sockaddr_storage *from,
                     sip_media_t *call);
 
 /* Send a bodyless final response (e.g. "486 Busy Here") to an INVITE we refuse,
  * echoing its dialog headers (adds a To-tag). */
 void sip_uas_decline(sip_media_t *listen, const char *invite,
-                     struct sockaddr_in *from, const char *status);
+                     struct sockaddr_storage *from, const char *status);
 
 /* Send a bodyless response (e.g. "200 OK" to a BYE, "488 Not Acceptable Here"
  * to a re-INVITE) echoing an in-dialog request's headers, to *to. */
 void sip_dialog_respond(sip_media_t *m, const char *req, const char *status,
-                        struct sockaddr_in *to);
+                        struct sockaddr_storage *to);
 
 /* Send an in-dialog BYE for *call from call->sip_sock to call->sip_peer using
  * its captured dialog state. Does not wait or close (the daemon reads the 200
@@ -176,6 +182,6 @@ void sip_call_send_bye(sip_media_t *call);
 
 /* Resend the stored 200 OK (answers a retransmitted initial INVITE whose ACK
  * hasn't arrived) to *to. */
-void sip_call_resend_ok(sip_media_t *call, struct sockaddr_in *to);
+void sip_call_resend_ok(sip_media_t *call, struct sockaddr_storage *to);
 
 #endif /* SIP_H */

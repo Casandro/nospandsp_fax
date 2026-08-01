@@ -35,9 +35,9 @@
 
 /* ── Low-level send/recv ──────────────────────────────────────────────── */
 
-static void sip_send(int sock, const char *buf, int len, struct sockaddr_in *to)
+static void sip_send(int sock, const char *buf, int len, struct sockaddr_storage *to)
 {
-    sendto(sock, buf, (size_t)len, 0, (struct sockaddr *)to, sizeof(*to));
+    sendto(sock, buf, (size_t)len, 0, (struct sockaddr *)to, sa_len(to));
 }
 
 /* Fill a Via branch token: the RFC 3261 magic cookie + 12 random hex digits.
@@ -56,9 +56,9 @@ static void vlog(const sip_media_t *m, const char *dir, const char *msg);
  * dialog requests we build ad hoc; the retransmit-cached 200 OK/ACK and the
  * two deliberately-unlogged sends (provisional 100/180, T.38 ACK) keep their
  * own inline builders. */
-static void sip_sendf(sip_media_t *m, struct sockaddr_in *to, const char *fmt, ...)
+static void sip_sendf(sip_media_t *m, struct sockaddr_storage *to, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
-static void sip_sendf(sip_media_t *m, struct sockaddr_in *to, const char *fmt, ...)
+static void sip_sendf(sip_media_t *m, struct sockaddr_storage *to, const char *fmt, ...)
 {
     char buf[2048];
     va_list ap;
@@ -74,7 +74,7 @@ static void sip_sendf(sip_media_t *m, struct sockaddr_in *to, const char *fmt, .
 /* Wait up to timeout_ms for one SIP datagram. Returns its length (NUL
  * terminated into buf), 0 on timeout, -1 on error. */
 static int sip_recv(int sock, char *buf, int cap, int timeout_ms,
-                    struct sockaddr_in *from)
+                    struct sockaddr_storage *from)
 {
     fd_set rfds;
     FD_ZERO(&rfds);
@@ -142,39 +142,88 @@ static void vlog(const sip_media_t *m, const char *dir, const char *msg)
 
 /* ── Local IP / address resolution ───────────────────────────────────── */
 
-/* Discover the source IP the kernel would use to reach dest (a dotted-quad),
- * via a throwaway connected UDP socket. Returns 0 on success. */
-static int get_local_ip(const char *dest, char *out, int outlen)
+/* Discover the source IP the kernel would use to reach *dest, via a throwaway
+ * connected UDP socket of dest's (unmapped) family. Returns 0 on success. */
+static int get_local_ip(const struct sockaddr_storage *dest, char *out, int outlen)
 {
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_storage a = *dest;
+    sa_map_to_af(&a, AF_INET);   /* unmap a v4-mapped peer; real IPv6 is kept */
+    if (sa_port(&a) == 0) sa_set_port(&a, 5060);
+    int s = socket(a.ss_family, SOCK_DGRAM, 0);
     if (s < 0) return -1;
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof(a));
-    a.sin_family = AF_INET;
-    a.sin_port   = htons(5060);
-    if (inet_pton(AF_INET, dest, &a.sin_addr) != 1) { close(s); return -1; }
-    if (connect(s, (struct sockaddr *)&a, sizeof(a)) < 0) { close(s); return -1; }
+    if (connect(s, (struct sockaddr *)&a, sa_len(&a)) < 0) { close(s); return -1; }
     socklen_t sl = sizeof(a);
     if (getsockname(s, (struct sockaddr *)&a, &sl) < 0) { close(s); return -1; }
     close(s);
-    const char *ip = inet_ntoa(a.sin_addr);
-    if (!ip) return -1;
-    strncpy(out, ip, (size_t)outlen - 1);
-    out[outlen - 1] = '\0';
+    sa_ntop(&a, out, (size_t)outlen);
+    return out[0] ? 0 : -1;
+}
+
+/* Resolve host:5060 into *addr (IPv4 or IPv6; a numeric IPv6 host may be
+ * given [bracketed] as in a SIP URI). Returns 0 on success. */
+static int resolve_host(const char *host, struct sockaddr_storage *addr)
+{
+    char bare[256];
+    size_t hl = strlen(host);
+    if (host[0] == '[' && hl >= 3 && host[hl - 1] == ']') {  /* [v6] -> v6 */
+        if (hl - 2 >= sizeof(bare)) return -1;
+        memcpy(bare, host + 1, hl - 2);
+        bare[hl - 2] = '\0';
+        host = bare;
+    }
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(host, "5060", &hints, &res) != 0 || !res) return -1;
+    memset(addr, 0, sizeof(*addr));
+    memcpy(addr, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
     return 0;
 }
 
-/* Resolve host:5060 into *addr (IPv4). Returns 0 on success. */
-static int resolve_host(const char *host, struct sockaddr_in *addr)
+/* Record the local IP in both forms: plain (SDP c=) and, for IPv6,
+ * [bracketed] (Via sent-by / Contact URI host). */
+static void set_local_ip(sip_media_t *m, const char *ip)
 {
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family   = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    if (getaddrinfo(host, "5060", &hints, &res) != 0 || !res) return -1;
-    *addr = *(struct sockaddr_in *)res->ai_addr;
-    freeaddrinfo(res);
-    return 0;
+    snprintf(m->local_ip, sizeof(m->local_ip), "%s", ip);
+    if (strchr(ip, ':'))
+        snprintf(m->local_uri_host, sizeof(m->local_uri_host), "[%s]", ip);
+    else
+        snprintf(m->local_uri_host, sizeof(m->local_uri_host), "%s", ip);
+}
+
+/* Open a UDP socket bound to the wildcard address at `port` (0 = ephemeral).
+ * Prefers a dual-stack AF_INET6 socket (IPV6_V6ONLY off, so IPv4 peers appear
+ * v4-mapped); falls back to AF_INET on IPv6-less kernels. *af gets the actual
+ * family. Returns the fd, or -1. */
+static int udp_open_af(int *af, int port)
+{
+    int s = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (s >= 0) {
+        int off = 0;
+        setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+        struct sockaddr_in6 a6;
+        memset(&a6, 0, sizeof(a6));
+        a6.sin6_family = AF_INET6;
+        a6.sin6_addr   = in6addr_any;
+        a6.sin6_port   = htons((uint16_t)port);
+        if (bind(s, (struct sockaddr *)&a6, sizeof(a6)) == 0) {
+            *af = AF_INET6;
+            return s;
+        }
+        close(s);
+    }
+    s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return -1;
+    struct sockaddr_in a4;
+    memset(&a4, 0, sizeof(a4));
+    a4.sin_family      = AF_INET;
+    a4.sin_addr.s_addr = INADDR_ANY;
+    a4.sin_port        = htons((uint16_t)port);
+    if (bind(s, (struct sockaddr *)&a4, sizeof(a4)) < 0) { close(s); return -1; }
+    *af = AF_INET;
+    return s;
 }
 
 /* ── RTP ──────────────────────────────────────────────────────────────── */
@@ -191,19 +240,13 @@ typedef struct __attribute__((packed)) {
  * via *port. */
 static int rtp_open(sip_media_t *m, int *port)
 {
-    m->rtp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int af;
+    m->rtp_sock = udp_open_af(&af, 0);
     if (m->rtp_sock < 0) return -1;
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof(a));
-    a.sin_family      = AF_INET;
-    a.sin_addr.s_addr = INADDR_ANY;
-    a.sin_port        = 0;
-    if (bind(m->rtp_sock, (struct sockaddr *)&a, sizeof(a)) < 0) {
-        close(m->rtp_sock); m->rtp_sock = -1; return -1;
-    }
+    struct sockaddr_storage a;
     socklen_t sl = sizeof(a);
     getsockname(m->rtp_sock, (struct sockaddr *)&a, &sl);
-    *port = ntohs(a.sin_port);
+    *port = sa_port(&a);
     m->rtp_ssrc = rng_u32();
     m->rtp_seq  = (uint16_t) rng_u32();
     m->rtp_ts   = rng_u32();
@@ -215,11 +258,10 @@ static int rtp_open(sip_media_t *m, int *port)
  * signalling peer. This still follows a NAT-mapped PORT change (the reason
  * symmetric RTP exists) but refuses to hand our media stream to an unrelated
  * host. Callers latch to the first plausible source and then lock it. */
-static int media_src_plausible(const sip_media_t *m, const struct sockaddr_in *src,
-                               const struct sockaddr_in *neg)
+static int media_src_plausible(const sip_media_t *m, const struct sockaddr_storage *src,
+                               const struct sockaddr_storage *neg)
 {
-    return src->sin_addr.s_addr == neg->sin_addr.s_addr ||
-           src->sin_addr.s_addr == m->sip_peer.sin_addr.s_addr;
+    return sa_same_addr(src, neg) || sa_same_addr(src, &m->sip_peer);
 }
 
 void sip_media_tx(sip_media_t *m, const int16_t *pcm, int n)
@@ -236,7 +278,7 @@ void sip_media_tx(sip_media_t *m, const int16_t *pcm, int n)
     for (int i = 0; i < n; i++)
         pkt[12 + i] = linear_to_alaw(pcm[i]);
     sendto(m->rtp_sock, pkt, (size_t)(12 + n), 0,
-           (struct sockaddr *)&m->remote_rtp, sizeof(m->remote_rtp));
+           (struct sockaddr *)&m->remote_rtp, sa_len(&m->remote_rtp));
     m->rtp_seq++;
     m->rtp_ts += RTP_TS_INCR;
 }
@@ -245,7 +287,7 @@ int sip_media_rx(sip_media_t *m, int16_t *pcm, int max)
 {
     if (m->rtp_sock < 0) return 0;
     uint8_t pkt[2048];
-    struct sockaddr_in src;
+    struct sockaddr_storage src;
     socklen_t sl = sizeof(src);
     ssize_t r = recvfrom(m->rtp_sock, pkt, sizeof(pkt), MSG_DONTWAIT,
                          (struct sockaddr *)&src, &sl);
@@ -259,8 +301,7 @@ int sip_media_rx(sip_media_t *m, int16_t *pcm, int max)
             return 0;                       /* unrelated host: drop */
         m->remote_rtp  = src;
         m->rtp_latched = 1;
-    } else if (src.sin_addr.s_addr != m->remote_rtp.sin_addr.s_addr ||
-               src.sin_port        != m->remote_rtp.sin_port) {
+    } else if (!sa_same_addr_port(&src, &m->remote_rtp)) {
         return 0;                           /* not our latched peer: drop */
     }
 
@@ -289,19 +330,43 @@ int sip_media_rx(sip_media_t *m, int16_t *pcm, int max)
 
 /* ── SDP ──────────────────────────────────────────────────────────────── */
 
+/* "IP4" or "IP6" for an SDP o=/c= line carrying this (unbracketed) address. */
+static const char *sdp_addrtype(const char *ip)
+{
+    return strchr(ip, ':') ? "IP6" : "IP4";
+}
+
 static int build_sdp(const char *local_ip, int rtp_port, char *sdp, int cap)
 {
     long t = (long)time(NULL);
+    const char *at = sdp_addrtype(local_ip);
     return snprintf(sdp, (size_t)cap,
         "v=0\r\n"
-        "o=- %ld %ld IN IP4 %s\r\n"
+        "o=- %ld %ld IN %s %s\r\n"
         "s=sip_fax\r\n"
-        "c=IN IP4 %s\r\n"
+        "c=IN %s %s\r\n"
         "t=0 0\r\n"
         "m=audio %d RTP/AVP 8\r\n"
         "a=rtpmap:8 PCMA/8000\r\n"
         "a=sendrecv\r\n",
-        t, t, local_ip, local_ip, rtp_port);
+        t, t, at, local_ip, at, local_ip, rtp_port);
+}
+
+/* Copy the address out of a "c=IN IP4/IP6 <addr>" line (bounded by eol) into
+ * remote_ip[64]. Leaves remote_ip untouched if the line has no address. */
+static void parse_c_line(const char *p, const char *eol, char *remote_ip)
+{
+    const char *ip = strstr(p, "IP4 ");
+    if (!ip || ip >= eol) {
+        ip = strstr(p, "IP6 ");
+        if (!ip || ip >= eol) return;
+    }
+    ip += 4;
+    int n = (int)(eol - ip);
+    if (n < 0) n = 0;
+    if (n > 63) n = 63;
+    memcpy(remote_ip, ip, (size_t)n);
+    remote_ip[n] = '\0';
 }
 
 /* Pull the audio destination (c=/m=) out of an SDP body and confirm PCMA (PT 8)
@@ -319,16 +384,9 @@ static int parse_sdp(const char *body, char *remote_ip, int *port)
         while (*eol && *eol != '\r' && *eol != '\n') eol++;
         if (p[0] == 'c' && p[1] == '=') {
             /* Search for the address only within this c= line, not the rest of
-             * the body: a malformed c= must not borrow an IP4 from a later line. */
-            const char *ip = strstr(p, "IP4 ");
-            if (ip && ip < eol) {
-                ip += 4;
-                int n = (int)(eol - ip);
-                if (n < 0) n = 0;
-                if (n > 63) n = 63;
-                memcpy(remote_ip, ip, (size_t)n);
-                remote_ip[n] = '\0';
-            }
+             * the body: a malformed c= must not borrow an address from a later
+             * line. */
+            parse_c_line(p, eol, remote_ip);
         } else if (p[0] == 'm' && p[1] == '=') {
             int pv;
             if (sscanf(p + 2, "audio %d", &pv) == 1) *port = pv;
@@ -354,10 +412,9 @@ static int parse_sdp(const char *body, char *remote_ip, int *port)
 /* Point m->remote_rtp at remote_ip:port. */
 static void set_remote_rtp(sip_media_t *m, const char *remote_ip, int port)
 {
-    memset(&m->remote_rtp, 0, sizeof(m->remote_rtp));
-    m->remote_rtp.sin_family = AF_INET;
-    m->remote_rtp.sin_port   = htons((uint16_t)port);
-    inet_pton(AF_INET, remote_ip, &m->remote_rtp.sin_addr);
+    if (sa_from_ip(&m->remote_rtp, m->af, remote_ip, port) != 0)
+        fprintf(stderr, "SDP media address '%s' unusable on this socket\n",
+                remote_ip);
     m->have_rtp_dest = 1;
     m->rtp_latched   = 0;   /* re-latch to the newly negotiated address */
 }
@@ -370,11 +427,12 @@ static void set_remote_rtp(sip_media_t *m, const char *remote_ip, int port)
 static int build_t38_sdp(const char *local_ip, int t38_port, char *sdp, int cap)
 {
     long t = (long) time(NULL);
+    const char *at = sdp_addrtype(local_ip);
     return snprintf(sdp, (size_t) cap,
         "v=0\r\n"
-        "o=- %ld %ld IN IP4 %s\r\n"
+        "o=- %ld %ld IN %s %s\r\n"
         "s=sip_fax\r\n"
-        "c=IN IP4 %s\r\n"
+        "c=IN %s %s\r\n"
         "t=0 0\r\n"
         "m=image %d udptl t38\r\n"
         "a=T38FaxVersion:0\r\n"
@@ -383,7 +441,7 @@ static int build_t38_sdp(const char *local_ip, int t38_port, char *sdp, int cap)
         "a=T38FaxMaxBuffer:1000\r\n"
         "a=T38FaxMaxDatagram:%d\r\n"
         "a=T38FaxUdpEC:t38UDPRedundancy\r\n",
-        t, t, local_ip, local_ip, t38_port, T38_MAX_DATAGRAM);
+        t, t, at, local_ip, at, local_ip, t38_port, T38_MAX_DATAGRAM);
 }
 
 /* Detect a T.38 offer in an SDP body. Returns 1 and fills remote_ip / *port /
@@ -402,15 +460,7 @@ static int parse_t38_sdp(const char *body, char *remote_ip, int *port, int *far_
         while (*eol && *eol != '\r' && *eol != '\n') eol++;
         if (p[0] == 'c' && p[1] == '=') {
             /* Search within this c= line only (see parse_sdp). */
-            const char *ip = strstr(p, "IP4 ");
-            if (ip && ip < eol) {
-                ip += 4;
-                int n = (int) (eol - ip);
-                if (n < 0) n = 0;
-                if (n > 63) n = 63;
-                memcpy(remote_ip, ip, (size_t) n);
-                remote_ip[n] = '\0';
-            }
+            parse_c_line(p, eol, remote_ip);
         } else if (p[0] == 'm' && p[1] == '=' && strncmp(p, "m=image", 7) == 0) {
             /* Require udptl+t38 on THIS m= line, not anywhere in the body. */
             const char *u = strstr(p, "udptl"), *t = strstr(p, "t38");
@@ -431,28 +481,21 @@ static int parse_t38_sdp(const char *body, char *remote_ip, int *port, int *far_
 /* Bind an ephemeral UDP port for T.38/UDPTL media. */
 static int udptl_open(sip_media_t *m, int *port)
 {
-    m->t38_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int af;
+    m->t38_sock = udp_open_af(&af, 0);
     if (m->t38_sock < 0) return -1;
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof(a));
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = INADDR_ANY;
-    a.sin_port = 0;
-    if (bind(m->t38_sock, (struct sockaddr *) &a, sizeof(a)) < 0) {
-        close(m->t38_sock); m->t38_sock = -1; return -1;
-    }
+    struct sockaddr_storage a;
     socklen_t sl = sizeof(a);
     getsockname(m->t38_sock, (struct sockaddr *) &a, &sl);
-    *port = ntohs(a.sin_port);
+    *port = sa_port(&a);
     return 0;
 }
 
 static void set_t38_peer(sip_media_t *m, const char *ip, int port)
 {
-    memset(&m->t38_peer, 0, sizeof(m->t38_peer));
-    m->t38_peer.sin_family = AF_INET;
-    m->t38_peer.sin_port = htons((uint16_t) port);
-    inet_pton(AF_INET, ip, &m->t38_peer.sin_addr);
+    if (sa_from_ip(&m->t38_peer, m->af, ip, port) != 0)
+        fprintf(stderr, "T.38 SDP media address '%s' unusable on this socket\n",
+                ip);
     m->t38_latched = 0;   /* re-latch to the newly negotiated address */
 }
 
@@ -462,42 +505,42 @@ void sip_t38_tx(sip_media_t *m, const uint8_t *dgram, int len)
 {
     if (m->t38_sock < 0) return;
     sendto(m->t38_sock, dgram, (size_t) len, 0,
-           (struct sockaddr *) &m->t38_peer, sizeof(m->t38_peer));
+           (struct sockaddr *) &m->t38_peer, sa_len(&m->t38_peer));
 }
 
 int sip_t38_rx(sip_media_t *m, uint8_t *buf, int max)
 {
     if (m->t38_sock < 0) return 0;
-    struct sockaddr_in src;
+    struct sockaddr_storage src;
     socklen_t sl = sizeof(src);
     ssize_t r = recvfrom(m->t38_sock, buf, (size_t) max, MSG_DONTWAIT,
                          (struct sockaddr *) &src, &sl);
     if (r <= 0) return 0;
     int dbg = getenv("NF_T38_DBG") != NULL;
+    char sip_[46], pip[46];
     /* Symmetric UDPTL: adopt the peer's actual source ONCE from a plausible
      * address, then lock it; ignore datagrams from any other source. */
     if (!m->t38_latched) {
         if (!media_src_plausible(m, &src, &m->t38_peer)) {
             if (dbg) fprintf(stderr, "[T38 sock] drop %zd bytes from %s:%d "
                              "(implausible; expected %s:%d)\n", r,
-                             inet_ntoa(src.sin_addr), ntohs(src.sin_port),
-                             inet_ntoa(m->t38_peer.sin_addr), ntohs(m->t38_peer.sin_port));
+                             sa_ntop(&src, sip_, sizeof sip_), sa_port(&src),
+                             sa_ntop(&m->t38_peer, pip, sizeof pip), sa_port(&m->t38_peer));
             return 0;                       /* unrelated host: drop */
         }
         m->t38_peer    = src;
         m->t38_latched = 1;
         if (dbg) fprintf(stderr, "[T38 sock] latched to %s:%d\n",
-                         inet_ntoa(src.sin_addr), ntohs(src.sin_port));
-    } else if (src.sin_addr.s_addr != m->t38_peer.sin_addr.s_addr ||
-               src.sin_port != m->t38_peer.sin_port) {
+                         sa_ntop(&src, sip_, sizeof sip_), sa_port(&src));
+    } else if (!sa_same_addr_port(&src, &m->t38_peer)) {
         if (dbg) fprintf(stderr, "[T38 sock] drop %zd bytes from %s:%d "
                          "(not latched peer %s:%d)\n", r,
-                         inet_ntoa(src.sin_addr), ntohs(src.sin_port),
-                         inet_ntoa(m->t38_peer.sin_addr), ntohs(m->t38_peer.sin_port));
+                         sa_ntop(&src, sip_, sizeof sip_), sa_port(&src),
+                         sa_ntop(&m->t38_peer, pip, sizeof pip), sa_port(&m->t38_peer));
         return 0;                           /* not our latched peer: drop */
     }
     if (dbg) fprintf(stderr, "[T38 sock] rx %zd bytes from %s:%d\n", r,
-                     inet_ntoa(src.sin_addr), ntohs(src.sin_port));
+                     sa_ntop(&src, sip_, sizeof sip_), sa_port(&src));
     return (int) r;
 }
 
@@ -609,7 +652,7 @@ static void challenge(const char *msg, char *realm, char *nonce,
 /* ── REGISTER (answer mode, optional) ─────────────────────────────────── */
 
 static int do_register(sip_media_t *m, const sip_config_t *cfg,
-                       struct sockaddr_in *reg_addr)
+                       struct sockaddr_storage *reg_addr)
 {
     char call_id[40], tok[20];
     gen_hex(tok, 16);
@@ -644,18 +687,18 @@ static int do_register(sip_media_t *m, const sip_config_t *cfg,
             "%s"
             "Content-Length: 0\r\n"
             "\r\n",
-            uri, m->local_ip, m->local_sip_port, branch,
+            uri, m->local_uri_host, m->local_sip_port, branch,
             cfg->local_user, cfg->registrar_host, from_tag,
             cfg->local_user, cfg->registrar_host,
             call_id, m->local_ip, cseq++,
-            cfg->local_user, m->local_ip, m->local_sip_port,
+            cfg->local_user, m->local_uri_host, m->local_sip_port,
             cfg->reg_expires, auth);
         if (n >= (int)sizeof(req)) n = (int)sizeof(req) - 1;
         sip_send(m->sip_sock, req, n, reg_addr);
         vlog(m, "TX", req);
 
         char resp[8192];
-        struct sockaddr_in from;
+        struct sockaddr_storage from;
         int r = sip_recv(m->sip_sock, resp, sizeof(resp), 4000, &from);
         if (r <= 0) { fprintf(stderr, "REGISTER: no response\n"); return -1; }
         vlog(m, "RX", resp);
@@ -706,10 +749,10 @@ static int build_invite(sip_media_t *m, const sip_config_t *cfg,
         "Content-Length: %d\r\n"
         "\r\n"
         "%s",
-        target_uri, m->local_ip, m->local_sip_port, branch,
+        target_uri, m->local_uri_host, m->local_sip_port, branch,
         cfg->local_user, cfg->registrar_host, from_tag,
         target_uri, m->call_id, cseq,
-        cfg->local_user, m->local_ip, m->local_sip_port,
+        cfg->local_user, m->local_uri_host, m->local_sip_port,
         auth, sdp_len, sdp);
     if (n >= cap) n = cap - 1;
     return n;
@@ -734,7 +777,7 @@ static void send_ack(sip_media_t *m, const sip_config_t *cfg,
         "CSeq: %d ACK\r\n"
         "Content-Length: 0\r\n"
         "\r\n",
-        target_uri, m->local_ip, m->local_sip_port, branch,
+        target_uri, m->local_uri_host, m->local_sip_port, branch,
         cfg->local_user, cfg->registrar_host, from_tag,
         to_hdr, m->call_id, cseq);
     if (n >= (int)sizeof(m->ok_buf)) n = (int)sizeof(m->ok_buf) - 1;
@@ -762,7 +805,7 @@ static void send_cancel(sip_media_t *m, const sip_config_t *cfg,
         "Call-ID: %s\r\n"
         "CSeq: %d CANCEL\r\n"
         "Content-Length: 0\r\n\r\n",
-        target_uri, m->local_ip, m->local_sip_port, branch,
+        target_uri, m->local_uri_host, m->local_sip_port, branch,
         cfg->local_user, cfg->registrar_host, from_tag, target_uri,
         m->call_id, cseq);
     if (n >= (int) sizeof req) n = (int) sizeof req - 1;
@@ -784,7 +827,7 @@ static void await_cancel_final(sip_media_t *m, const sip_config_t *cfg,
     for (;;) {
         long w = ts_until_ms(&dl);
         if (w <= 0) break;
-        char resp[8192]; struct sockaddr_in from;
+        char resp[8192]; struct sockaddr_storage from;
         int r = sip_recv(m->sip_sock, resp, sizeof resp, (int) w, &from);
         if (r <= 0) break;
         vlog(m, "RX", resp);
@@ -832,31 +875,29 @@ int sip_stop_requested(void) { return g_sip_stop; }
 
 static int uac_establish(const sip_config_t *cfg, sip_media_t *m)
 {
-    struct sockaddr_in proxy;
+    struct sockaddr_storage proxy;
     if (resolve_host(cfg->registrar_host, &proxy) < 0) {
         fprintf(stderr, "cannot resolve %s\n", cfg->registrar_host);
         return -1;
     }
-    m->sip_peer = proxy;
 
-    if (get_local_ip(inet_ntoa(proxy.sin_addr), m->local_ip, sizeof(m->local_ip)) < 0) {
+    char lip[64];
+    if (get_local_ip(&proxy, lip, sizeof(lip)) < 0) {
         fprintf(stderr, "cannot determine local IP\n");
         return -1;
     }
+    set_local_ip(m, lip);
 
     /* Bind the local SIP socket; its port appears in our Via/Contact. */
-    m->sip_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (m->sip_sock < 0) { perror("socket SIP"); return -1; }
-    struct sockaddr_in local;
-    memset(&local, 0, sizeof(local));
-    local.sin_family      = AF_INET;
-    local.sin_addr.s_addr = INADDR_ANY;
-    local.sin_port        = htons((uint16_t)cfg->local_sip_port);
-    if (bind(m->sip_sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
-        perror("bind SIP");
+    m->sip_sock = udp_open_af(&m->af, cfg->local_sip_port);
+    if (m->sip_sock < 0) { perror("socket/bind SIP"); return -1; }
+    if (sa_map_to_af(&proxy, m->af) != 0) {
+        fprintf(stderr, "%s is IPv6 but this host has no IPv6 support\n",
+                cfg->registrar_host);
         close(m->sip_sock); m->sip_sock = -1;
         return -1;
     }
+    m->sip_peer = proxy;
 
     /* Normalize the dial target into a sip: URI. */
     char target_uri[600];
@@ -932,7 +973,7 @@ static int uac_establish(const sip_config_t *cfg, sip_media_t *m)
         if (wms < 0) wms = 0;
 
         char resp[8192];
-        struct sockaddr_in from;
+        struct sockaddr_storage from;
         int r = sip_recv(m->sip_sock, resp, sizeof(resp), (int)wms, &from);
         if (r < 0) {
             if (g_sip_stop) continue;       /* signal interrupted the wait: cancel at top */
@@ -1032,13 +1073,21 @@ static int uac_establish(const sip_config_t *cfg, sip_media_t *m)
  * serviced on the parent's main loop). Returns 0, or -1 if the INVITE carries
  * no usable PCMA SDP. */
 static int uas_send_answer(const sip_config_t *cfg, sip_media_t *m,
-                           const char *msg, struct sockaddr_in *from)
+                           const char *msg, struct sockaddr_storage *from)
 {
     char rip[64]; int rport;
     if (!parse_sdp(sip_body(msg), rip, &rport)) {
         fprintf(stderr, "INVITE has no usable PCMA SDP - rejecting\n");
         return -1;
     }
+
+    /* Present the local address the peer can actually reach us on: the one
+     * the kernel routes to the INVITE's source. On a dual-stack listener this
+     * picks the right family (and interface) per call, overriding the
+     * registrar-probe default. */
+    char lip[64];
+    if (get_local_ip(from, lip, sizeof(lip)) == 0)
+        set_local_ip(m, lip);
 
     char via[512] = "", fr[300] = "", to[300] = "", cseq[64] = "", contact[300] = "";
     sip_hdr(msg, "Via",     via,     sizeof(via));
@@ -1091,7 +1140,7 @@ static int uas_send_answer(const sip_config_t *cfg, sip_media_t *m,
         "\r\n"
         "%s",
         via, fr, to_with_tag, m->call_id, cseq,
-        cfg->local_user, m->local_ip, m->local_sip_port, sdp_len, sdp);
+        cfg->local_user, m->local_uri_host, m->local_sip_port, sdp_len, sdp);
     if (n >= (int)sizeof(m->ok_buf)) n = (int)sizeof(m->ok_buf) - 1;
     m->ok_buf_len = n;
     sip_send(m->sip_sock, m->ok_buf, n, from);
@@ -1106,7 +1155,7 @@ static int uas_send_answer(const sip_config_t *cfg, sip_media_t *m,
 }
 
 static int uas_answer(const sip_config_t *cfg, sip_media_t *m,
-                      const char *msg, struct sockaddr_in *from)
+                      const char *msg, struct sockaddr_storage *from)
 {
     if (uas_send_answer(cfg, m, msg, from) < 0)
         return -1;
@@ -1127,7 +1176,7 @@ static int uas_answer(const sip_config_t *cfg, sip_media_t *m,
         if (wms < 0) wms = 0;
 
         char buf[8192];
-        struct sockaddr_in src;
+        struct sockaddr_storage src;
         int r = sip_recv(m->sip_sock, buf, sizeof(buf), (int)wms, &src);
         if (r < 0) return -1;
         if (r == 0) {
@@ -1167,31 +1216,23 @@ int sip_media_establish(const sip_config_t *cfg, sip_media_t *m)
         return uac_establish(cfg, m);
 
     /* Answer mode: bind the SIP port, optionally register, await an INVITE. */
-    m->sip_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (m->sip_sock < 0) { perror("socket SIP"); return -1; }
-    struct sockaddr_in local;
-    memset(&local, 0, sizeof(local));
-    local.sin_family      = AF_INET;
-    local.sin_addr.s_addr = INADDR_ANY;
-    local.sin_port        = htons((uint16_t)cfg->local_sip_port);
-    if (bind(m->sip_sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
-        perror("bind SIP");
-        close(m->sip_sock); m->sip_sock = -1;
-        return -1;
-    }
+    m->sip_sock = udp_open_af(&m->af, cfg->local_sip_port);
+    if (m->sip_sock < 0) { perror("socket/bind SIP"); return -1; }
 
     /* Determine a local IP for SDP/Contact: route to the registrar if known,
-     * else to a public address to learn the default-route interface. */
+     * else to a public address to learn the default-route interface. (Per-call
+     * this is refined against the INVITE's actual source in uas_send_answer.) */
     const char *probe = cfg->registrar_host[0] ? cfg->registrar_host : "8.8.8.8";
-    struct sockaddr_in pa;
+    struct sockaddr_storage pa;
+    char lip[64] = "";
     if (resolve_host(probe, &pa) == 0)
-        get_local_ip(inet_ntoa(pa.sin_addr), m->local_ip, sizeof(m->local_ip));
-    if (!m->local_ip[0])
-        strcpy(m->local_ip, "127.0.0.1");
+        get_local_ip(&pa, lip, sizeof(lip));
+    set_local_ip(m, lip[0] ? lip : "127.0.0.1");
 
     if (cfg->do_register) {
-        struct sockaddr_in reg_addr;
+        struct sockaddr_storage reg_addr;
         if (resolve_host(cfg->registrar_host, &reg_addr) < 0 ||
+            sa_map_to_af(&reg_addr, m->af) != 0 ||
             do_register(m, cfg, &reg_addr) < 0)
             return -1;
     }
@@ -1199,7 +1240,7 @@ int sip_media_establish(const sip_config_t *cfg, sip_media_t *m)
     fprintf(stderr, "Waiting for inbound INVITE on port %d ...\n", cfg->local_sip_port);
     for (;;) {
         char buf[8192];
-        struct sockaddr_in from;
+        struct sockaddr_storage from;
         int r = sip_recv(m->sip_sock, buf, sizeof(buf), 3600 * 1000, &from);
         if (r <= 0) continue;
         if (sip_response_code(buf) > 0) continue;   /* ignore stray responses */
@@ -1231,7 +1272,7 @@ static void sip_echo_hdrs(const char *req, struct sip_echo *e)
  * (used to answer an inbound BYE with 200, or decline a re-INVITE with 488).
  * For an in-dialog request the echoed To already carries our dialog tag. */
 void sip_dialog_respond(sip_media_t *m, const char *req,
-                        const char *status, struct sockaddr_in *to)
+                        const char *status, struct sockaddr_storage *to)
 {
     struct sip_echo e;
     sip_echo_hdrs(req, &e);
@@ -1244,7 +1285,7 @@ void sip_dialog_respond(sip_media_t *m, const char *req,
 
 /* Answer an in-dialog re-INVITE with 200 OK carrying our T.38 SDP. */
 static void respond_t38_200(sip_media_t *m, const char *req,
-                            struct sockaddr_in *to, int t38_port)
+                            struct sockaddr_storage *to, int t38_port)
 {
     struct sip_echo e;
     sip_echo_hdrs(req, &e);
@@ -1255,8 +1296,8 @@ static void respond_t38_200(sip_media_t *m, const char *req,
         "Via: %s\r\nFrom: %s\r\nTo: %s\r\nCall-ID: %s\r\nCSeq: %s\r\n"
         "Contact: <sip:%s@%s:%d>\r\n"
         "Content-Type: application/sdp\r\nContent-Length: %d\r\n\r\n%s",
-        e.via, e.from, e.to, e.cid, e.cseq, m->local_user, m->local_ip, m->local_sip_port,
-        sdp_len, sdp);
+        e.via, e.from, e.to, e.cid, e.cseq, m->local_user, m->local_uri_host,
+        m->local_sip_port, sdp_len, sdp);
 }
 
 /* Daemon helper: accept an in-dialog T.38 re-INVITE on dialog `dlg`, answering
@@ -1265,7 +1306,7 @@ static void respond_t38_200(sip_media_t *m, const char *req,
  * success — the caller may hand it to another process (SCM_RIGHTS) and then close
  * its own copy — or -1 if `req` is not an acceptable T.38 offer (caller should
  * then answer 488). On success *far_datagram and *local_port are filled. */
-int sip_t38_accept(sip_media_t *dlg, const char *req, struct sockaddr_in *from,
+int sip_t38_accept(sip_media_t *dlg, const char *req, struct sockaddr_storage *from,
                    int *far_datagram, int *local_port)
 {
     char rip[64]; int tport = 0, fdg = T38_MAX_DATAGRAM, lp = 0;
@@ -1288,7 +1329,7 @@ int sip_t38_accept(sip_media_t *dlg, const char *req, struct sockaddr_in *from,
 /* Re-answer a retransmitted T.38 re-INVITE (an earlier 200 was lost). The UDPTL
  * socket already lives in the media child, so we just rebuild the 200 from the
  * remembered local port. */
-void sip_t38_reanswer(sip_media_t *dlg, const char *req, struct sockaddr_in *from,
+void sip_t38_reanswer(sip_media_t *dlg, const char *req, struct sockaddr_storage *from,
                       int local_port)
 {
     respond_t38_200(dlg, req, from, local_port);
@@ -1303,13 +1344,13 @@ void sip_t38_reanswer(sip_media_t *dlg, const char *req, struct sockaddr_in *fro
  * SDP c= line. Tag matching would be stricter, but this stack keeps only the
  * composite From/To header values, so Call-ID + source address is the check. */
 static int in_dialog(const sip_media_t *m, const char *req,
-                     const struct sockaddr_in *from)
+                     const struct sockaddr_storage *from)
 {
     char cid[256] = "";
     sip_hdr(req, "Call-ID", cid, sizeof(cid));
     if (m->call_id[0] == '\0' || strcmp(cid, m->call_id) != 0)
         return 0;
-    if (from->sin_addr.s_addr != m->sip_peer.sin_addr.s_addr)
+    if (!sa_same_addr(from, &m->sip_peer))
         return 0;
     return 1;
 }
@@ -1317,7 +1358,7 @@ static int in_dialog(const sip_media_t *m, const char *req,
 int sip_media_poll_sip(sip_media_t *m)
 {
     char buf[8192];
-    struct sockaddr_in from;
+    struct sockaddr_storage from;
     socklen_t sl = sizeof(from);
     ssize_t r = recvfrom(m->sip_sock, buf, sizeof(buf) - 1, MSG_DONTWAIT,
                          (struct sockaddr *)&from, &sl);
@@ -1372,9 +1413,9 @@ int sip_media_poll_sip(sip_media_t *m)
                 return 0;
             }
             if (lp == 0) {              /* already open: recover our local port */
-                struct sockaddr_in a; socklen_t sl = sizeof(a);
+                struct sockaddr_storage a; socklen_t sl = sizeof(a);
                 getsockname(m->t38_sock, (struct sockaddr *) &a, &sl);
-                lp = ntohs(a.sin_port);
+                lp = sa_port(&a);
             }
             set_t38_peer(m, rip, tport);
             m->t38_far_datagram = fdg;
@@ -1412,7 +1453,7 @@ void sip_call_send_bye(sip_media_t *m)
         "CSeq: %d BYE\r\n"
         "Content-Length: 0\r\n"
         "\r\n",
-        m->bye_ruri, m->local_ip, m->local_sip_port, branch,
+        m->bye_ruri, m->local_uri_host, m->local_sip_port, branch,
         m->bye_from, m->bye_to, m->call_id, m->cseq);
 }
 
@@ -1437,7 +1478,7 @@ static void t38_send_ack(sip_media_t *m, const char *to_hdr, int cseq,
         "Via: SIP/2.0/UDP %s:%d;branch=%s;rport\r\n"
         "Max-Forwards: 70\r\nFrom: %s\r\nTo: %s\r\nCall-ID: %s\r\n"
         "CSeq: %d ACK\r\nContent-Length: 0\r\n\r\n",
-        m->bye_ruri, m->local_ip, m->local_sip_port, branch,
+        m->bye_ruri, m->local_uri_host, m->local_sip_port, branch,
         m->bye_from, to_hdr, m->call_id, cseq);
     if (n >= (int)sizeof(m->ok_buf)) n = (int)sizeof(m->ok_buf) - 1;
     m->ok_buf_len = n;
@@ -1452,8 +1493,8 @@ int sip_offer_t38(sip_media_t *m, const sip_config_t *cfg)
         if (udptl_open(m, &p) < 0) return 0;
     }
     int lp;
-    { struct sockaddr_in a; socklen_t sl = sizeof(a);
-      getsockname(m->t38_sock, (struct sockaddr *) &a, &sl); lp = ntohs(a.sin_port); }
+    { struct sockaddr_storage a; socklen_t sl = sizeof(a);
+      getsockname(m->t38_sock, (struct sockaddr *) &a, &sl); lp = sa_port(&a); }
 
     char realm[256] = "", nonce[256] = "", qop[64] = "", opaque[192] = "";
     for (int attempt = 0; attempt < 2; attempt++) {
@@ -1470,13 +1511,13 @@ int sip_offer_t38(sip_media_t *m, const sip_config_t *cfg)
             "Max-Forwards: 70\r\nFrom: %s\r\nTo: %s\r\nCall-ID: %s\r\n"
             "CSeq: %d INVITE\r\nContact: <sip:%s@%s:%d>\r\n%s"
             "Content-Type: application/sdp\r\nContent-Length: %d\r\n\r\n%s",
-            m->bye_ruri, m->local_ip, m->local_sip_port, branch,
+            m->bye_ruri, m->local_uri_host, m->local_sip_port, branch,
             m->bye_from, m->bye_to, m->call_id, my_cseq,
-            cfg->local_user, m->local_ip, m->local_sip_port, auth, sdp_len, sdp);
+            cfg->local_user, m->local_uri_host, m->local_sip_port, auth, sdp_len, sdp);
 
         int retry = 0;
         for (;;) {
-            char resp[8192]; struct sockaddr_in src;
+            char resp[8192]; struct sockaddr_storage src;
             int r = sip_recv(m->sip_sock, resp, sizeof(resp), 6000, &src);
             if (r <= 0) return 0;                       /* no answer */
             vlog(m, "RX", resp);
@@ -1527,7 +1568,7 @@ void sip_media_hangup(sip_media_t *m)
 
         /* Best-effort: wait briefly for the 200 to BYE. */
         char resp[2048];
-        struct sockaddr_in src;
+        struct sockaddr_storage src;
         sip_recv(m->sip_sock, resp, sizeof(resp), 1000, &src);
     }
     if (m->rtp_sock >= 0) { close(m->rtp_sock); m->rtp_sock = -1; }
@@ -1539,9 +1580,14 @@ void sip_media_hangup(sip_media_t *m)
 
 int sip_daemon_register(sip_media_t *m, const sip_config_t *cfg)
 {
-    struct sockaddr_in reg_addr;
+    struct sockaddr_storage reg_addr;
     if (resolve_host(cfg->registrar_host, &reg_addr) < 0) {
         fprintf(stderr, "cannot resolve registrar %s\n", cfg->registrar_host);
+        return -1;
+    }
+    if (sa_map_to_af(&reg_addr, m->af) != 0) {
+        fprintf(stderr, "registrar %s is IPv6 but this host has no IPv6 support\n",
+                cfg->registrar_host);
         return -1;
     }
     return do_register(m, cfg, &reg_addr);
@@ -1557,26 +1603,17 @@ int sip_daemon_listen(const sip_config_t *cfg, sip_media_t *m)
     m->verbose        = cfg->verbose;
     m->local_sip_port = cfg->local_sip_port;
 
-    m->sip_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (m->sip_sock < 0) { perror("socket SIP"); return -1; }
-    struct sockaddr_in local;
-    memset(&local, 0, sizeof(local));
-    local.sin_family      = AF_INET;
-    local.sin_addr.s_addr = INADDR_ANY;
-    local.sin_port        = htons((uint16_t)cfg->local_sip_port);
-    if (bind(m->sip_sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
-        perror("bind SIP");
-        close(m->sip_sock); m->sip_sock = -1;
-        return -1;
-    }
+    m->sip_sock = udp_open_af(&m->af, cfg->local_sip_port);
+    if (m->sip_sock < 0) { perror("socket/bind SIP"); return -1; }
 
-    /* Local IP for SDP/Contact: route to the registrar (else a public probe). */
+    /* Local IP for SDP/Contact: route to the registrar (else a public probe).
+     * Per-call this is refined against the INVITE's source in uas_send_answer. */
     const char *probe = cfg->registrar_host[0] ? cfg->registrar_host : "8.8.8.8";
-    struct sockaddr_in pa;
+    struct sockaddr_storage pa;
+    char lip[64] = "";
     if (resolve_host(probe, &pa) == 0)
-        get_local_ip(inet_ntoa(pa.sin_addr), m->local_ip, sizeof(m->local_ip));
-    if (!m->local_ip[0])
-        strcpy(m->local_ip, "127.0.0.1");
+        get_local_ip(&pa, lip, sizeof(lip));
+    set_local_ip(m, lip[0] ? lip : "127.0.0.1");
 
     if (cfg->do_register && sip_daemon_register(m, cfg) < 0)
         return -1;
@@ -1584,7 +1621,7 @@ int sip_daemon_listen(const sip_config_t *cfg, sip_media_t *m)
 }
 
 int sip_uas_accept(const sip_config_t *cfg, sip_media_t *listen,
-                   const char *invite, struct sockaddr_in *from,
+                   const char *invite, struct sockaddr_storage *from,
                    sip_media_t *call)
 {
     memset(call, 0, sizeof(*call));
@@ -1595,19 +1632,21 @@ int sip_uas_accept(const sip_config_t *cfg, sip_media_t *listen,
     call->sip_sock       = listen->sip_sock;  /* parent answers in-dialog here */
     call->verbose        = listen->verbose;
     call->local_sip_port = listen->local_sip_port;
+    call->af             = listen->af;
     memcpy(call->local_ip, listen->local_ip, sizeof(call->local_ip));
+    memcpy(call->local_uri_host, listen->local_uri_host, sizeof(call->local_uri_host));
     snprintf(call->local_user, sizeof(call->local_user), "%s", cfg->local_user);
     return uas_send_answer(cfg, call, invite, from);
 }
 
-void sip_call_resend_ok(sip_media_t *call, struct sockaddr_in *to)
+void sip_call_resend_ok(sip_media_t *call, struct sockaddr_storage *to)
 {
     if (call->ok_buf_len > 0)
         sip_send(call->sip_sock, call->ok_buf, call->ok_buf_len, to);
 }
 
 void sip_uas_decline(sip_media_t *listen, const char *invite,
-                     struct sockaddr_in *from, const char *status)
+                     struct sockaddr_storage *from, const char *status)
 {
     struct sip_echo e;
     sip_echo_hdrs(invite, &e);

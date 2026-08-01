@@ -1183,7 +1183,7 @@ static int run_fax_t38(sip_media_t *m, int sending, const char *file,
 enum { DCTL_STOP = 'S', DCTL_T38 = 'T' };
 struct dctl_msg {
     char               op;            /* DCTL_STOP / DCTL_T38              */
-    struct sockaddr_in peer;          /* T.38 UDPTL peer (DCTL_T38)        */
+    struct sockaddr_storage peer;     /* T.38 UDPTL peer (DCTL_T38)        */
     int                far_datagram;  /* peer T38FaxMaxDatagram (DCTL_T38) */
 };
 
@@ -1339,7 +1339,7 @@ static void daemon_stop_child(int fd)
 /* Hand a freshly-opened UDPTL socket (and the T.38 peer/params) to the media
  * child so it can switch from audio to T.38. Returns 0 on success. */
 static int daemon_handoff_t38(int ctrl, int udptl_fd,
-                              const struct sockaddr_in *peer, int far_datagram)
+                              const struct sockaddr_storage *peer, int far_datagram)
 {
     struct dctl_msg m;
     memset(&m, 0, sizeof(m));
@@ -1418,7 +1418,7 @@ static int run_fax_media(sip_media_t *m, int stop_fd, const char *tiff_path,
 /* Receive one SIP datagram on the listening socket, up to timeout_ms. Returns
  * its length (NUL-terminated into buf), 0 on timeout, -1 on error/EINTR. */
 static int daemon_sip_recv(int sock, char *buf, int cap, int timeout_ms,
-                           struct sockaddr_in *from)
+                           struct sockaddr_storage *from)
 {
     fd_set rfds;
     FD_ZERO(&rfds);
@@ -1472,7 +1472,7 @@ static void daemon_reap(struct dcall *calls)
 /* Accept a new INVITE: spool its bytes, answer it, and fork the media child. */
 static void daemon_accept(struct dcall *calls, sip_media_t *listen,
                           const sip_config_t *cfg, const char *invite,
-                          struct sockaddr_in *from)
+                          struct sockaddr_storage *from)
 {
     char cid[256] = "";
     sip_hdr(invite, "Call-ID", cid, sizeof(cid));
@@ -1563,7 +1563,7 @@ static void daemon_accept(struct dcall *calls, sip_media_t *listen,
 /* Dispatch one received SIP message in the parent. */
 static void daemon_dispatch(struct dcall *calls, sip_media_t *listen,
                             const sip_config_t *cfg, char *buf,
-                            struct sockaddr_in *from)
+                            struct sockaddr_storage *from)
 {
     char cid[256] = ""; sip_hdr(buf, "Call-ID", cid, sizeof(cid));
 
@@ -1586,7 +1586,7 @@ static void daemon_dispatch(struct dcall *calls, sip_media_t *listen,
         if (!c) { daemon_accept(calls, listen, cfg, buf, from); return; }
         /* In-dialog re-INVITE (Call-ID already matched): require it to come
          * from the call's peer, else a guessed Call-ID could redirect media. */
-        if (from->sin_addr.s_addr != c->call.sip_peer.sin_addr.s_addr) {
+        if (!sa_same_addr(from, &c->call.sip_peer)) {
             if (cfg->verbose)
                 fprintf(stderr, "[%s] ignoring off-dialog re-INVITE (source mismatch)\n",
                         c->call_id);
@@ -1626,7 +1626,7 @@ static void daemon_dispatch(struct dcall *calls, sip_media_t *listen,
 
     /* In-dialog request with a matching Call-ID must also come from the call's
      * peer; otherwise a guessed Call-ID would let any host end the call. */
-    if (from->sin_addr.s_addr != c->call.sip_peer.sin_addr.s_addr) {
+    if (!sa_same_addr(from, &c->call.sip_peer)) {
         if (cfg->verbose)
             fprintf(stderr, "[%s] ignoring off-dialog %s (source mismatch)\n",
                     c->call_id, method);
@@ -1704,7 +1704,7 @@ static int run_daemon(const sip_config_t *cfg)
         if (wms < 0) wms = 0;
 
         char buf[8192];
-        struct sockaddr_in from;
+        struct sockaddr_storage from;
         int r = daemon_sip_recv(listen.sip_sock, buf, sizeof(buf), (int) wms, &from);
         if (r <= 0) continue;        /* timeout or EINTR (signal): loop back */
 
@@ -1770,7 +1770,8 @@ static void usage(const char *argv0)
         "  --sip-dial <target>   SIP: place a call (UAC). target is a sip: URI,\n"
         "                        user@host, or bare user/number on the --user host\n"
         "  --sip-answer          SIP: answer one inbound INVITE (UAS)\n"
-        "  --user sip:user@host  SIP identity (required for SIP modes)\n"
+        "  --user sip:user@host  SIP identity (required for SIP modes); host may\n"
+        "                        be a name, IPv4, or [bracketed] numeric IPv6\n"
         "  --password <pw>       SIP digest password (or set $SIP_PASSWORD)\n"
         "  --sip-port <port>     local SIP UDP port (default 5060)\n"
         "  --register            answer mode: REGISTER upstream before answering\n"

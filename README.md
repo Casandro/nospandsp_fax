@@ -3,9 +3,10 @@
 ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️ This is slopware, made by an LLM. There is no reason to trust this code. I also claim no ownership of this code. It was created by a machine. I consider it to be public domain.
 
 A fax CLI fully **weaned off [spandsp](https://www.soft-switch.org/)**,
-cross-checked against the stock `../spandsp_fax` build via `../xcheck.sh` and
-`../sweep.sh`. The entire fax engine is **our own code**; `sip_fax` builds and
-links without spandsp (spandsp remains only as the test oracle in the offline
+cross-checked against a stock spandsp build (`spandsp_fax`) via the `xcheck.sh`
+and `sweep.sh` harnesses in the companion `fax3` workspace (not part of this
+repo). The entire fax engine is **our own code**; `sip_fax` builds and links
+without spandsp (spandsp remains only as the test oracle in the offline
 regression harnesses):
 
 - **`nf_t4`** — ITU-T T.4 / T.6 image codec (MH 1-D, MR 2-D, MMR), bit-for-bit
@@ -49,12 +50,14 @@ regression harnesses):
   (`nf_modemtest`): both directions per modem and rate, clean / A-law / AWGN,
   side-by-side receiver parity on identical impaired audio (`dualrx`), V.17
   short-train sequences, and tx level calibration. The end-to-end impairment
-  acceptance gate is `../sweep.sh` (see below).
+  acceptance gate is the `fax3` workspace's `sweep.sh` (see below).
 
 For the full set of fax modem modes and rates — the call-setup tones, V.8
 negotiation, the V.21 control channel, the V.17/V.29/V.27ter fallback ladder,
 V.34 "Super G3", and the T.38 mapping — see
-[docs/MODEM_MODES.md](docs/MODEM_MODES.md).
+[docs/MODEM_MODES.md](docs/MODEM_MODES.md). V.34 is offered by default; the
+`--v34` / `--no-v34` / `--require-v34` / `--no-redial` switches controlling it
+are documented there too.
 
 It interoperates with real spandsp in both directions (verified: `nf_t30` ↔
 spandsp, pixel-perfect, in non-ECM and ECM). Regression harnesses: `make check`
@@ -67,7 +70,7 @@ and the T.38 suites `make check-t38` (nf↔nf over UDPTL) / `make check-t38-inte
 (against spandsp's `t38_terminal`, both directions) / `make check-t38-gateway`
 (against spandsp's re-modulating `t38_gateway` — see [T.38](#t38-fax-over-ip)).
 spandsp 0.0.6 implements neither colour nor file transfer, so those two are
-verified **nf↔nf** (between two instances of this build) rather than against th
+verified **nf↔nf** (between two instances of this build) rather than against the
 spandsp oracle.
 
 It offers two transports for the fax audio, and the fax role
@@ -81,7 +84,7 @@ It offers two transports for the fax audio, and the fax role
   **G.711 A-law (PCMA), 8 kHz** RTP media. One call per run, no threads; either
   place a call (UAC) or answer one inbound INVITE (UAS), optionally registering
   first. The signalling lives in `sip.c` / `sip_util.c` and is modelled on the
-  fuller stack in `../sip_modem/sip_interface`.
+  fuller stack in the separate `sip_modem` project's `sip_interface`.
 
 ## Build
 
@@ -91,8 +94,11 @@ It offers two transports for the fax audio, and the fax role
 make
 ```
 
-The offline regression harnesses (`make check`, `check-modem`, `check-fax`,
-`check-ecm`) additionally need `spandsp` — purely as the cross-check oracle.
+Most offline regression harnesses (`make check`, `check-modem`, `check-fax`,
+`check-ecm`, `check-v8`, `check-t38-interop`, `check-t38-gateway`)
+additionally need `spandsp` — purely as the cross-check oracle. The nf-only
+suites (`check-color`, `check-ctc`, `check-t38`, `check-v34`, `check-v34fax`,
+`check-md5`) do not.
 
 ## Usage
 
@@ -101,11 +107,16 @@ exactly one of each.
 
 ```
 sip_fax ( --send <file> | --send-alt <res>:<file> ... | --receive <file.tiff>
-        | --send-color <rgb.tiff> | --send-file <path> | --receive-file <path> )
+        | --send-color <rgb.tiff> | --send-gray <file.tiff>
+        | --send-file <path> | --receive-file <path> )
         ( --listen <port> | --connect <host:port>     [TCP pipe]
-        | --sip-dial <target> | --sip-answer )         [SIP/RTP]
+        | --sip-dial <target> | --sip-answer | --daemon <spooldir> )  [SIP/RTP]
+        [--poll | --poll-serve] [--require-color]
         [--user sip:user@host] [--password <pw>] [--sip-port <port>]
-        [--register] [--ident <str>] [--no-ecm] [--t38] [--color-quality <1..100>] [--verbose]
+        [--register] [--reg-interval <sec>] [--ident <str>]
+        [--no-ecm] [--t38] [--v34|--no-v34] [--require-v34] [--no-redial]
+        [--color-quality <1..100>] [--verbose] [--debug [--debug-dir <dir>]]
+        [--replay-rx <file.pcm>]
 ```
 
 `--t38` opts in to **T.38** (fax over IP, the demodulated-T.30 transport); see
@@ -115,7 +126,7 @@ audio, and any mid-call T.38 re-INVITE is declined with `488`.
 **Send progress meter.** When transmitting (any transport), a progress display
 estimates how much of the page is sent and the time remaining, from the bytes
 of encoded image transmitted vs. the page size at the negotiated bit rate:
-`page P/N  NN%  sent/total B  ETA M:SS`. On a terminal it updates one line in
+`page P/N  NN%  sent/total B  <modem> <rate>bps  ETA M:SS`. On a terminal it updates one line in
 place; when stderr is redirected/piped (or `--verbose` is set) it prints a
 periodic line instead. Receiving is unaffected.
 
@@ -147,7 +158,9 @@ sip_fax --send doc.pam --sip-dial fax --user sip:fax@192.0.2.10 --sip-port 5062
 
 `--sip-dial <target>` accepts a full `sip:` URI, `user@host`, or a bare
 user/number (resolved against the `--user` host). Add `--register` in answer
-mode to REGISTER with the registrar before waiting for the call.
+mode to REGISTER with the registrar before waiting for the call. Hosts may be
+names, IPv4 or IPv6 addresses; numeric IPv6 is written bracketed, e.g.
+`--user 'sip:fax@[2001:db8::1]'` (see [SIP stack scope](#sip-stack-scope)).
 
 ### Daemon mode (`--daemon`) — a concurrent inbound-fax spooler
 
@@ -204,9 +217,9 @@ e.g. `a3f1c0d9e2b48157.tiff` alongside `a3f1c0d9e2b48157.invite`.
 
 The format is detected from the file's magic number:
 
-- **TIFF** (`II*`/`MM*`) — sent **as-is**, straight to spandsp's T.30 engine. Must
+- **TIFF** (`II*`/`MM*`) — sent **as-is**, straight to the T.30 engine. Must
   be **bilevel** (1 bit/sample). A **multi-page TIFF transmits as a multi-page
-  document** — spandsp sends each TIFF directory as one fax page. This is the
+  document** — each TIFF directory is sent as one fax page. This is the
   native fax container and the recommended way to send documents (see
   [Multi-page documents](#multi-page-documents-pdf--tiff) below).
 - **PBM** (`P4` binary / `P1` ASCII) — single page, converted to a fax TIFF.
@@ -219,7 +232,7 @@ more than one page is received.
 
 ### Sending multiple resolutions (`--send-alt`)
 
-A fax engine and the remote negotiate a resolution, and spandsp does **not** rescale
+A fax engine and the remote negotiate a resolution, and the engine does **not** rescale
 on transmit — it sends a TIFF at the resolution baked into its tags. So to make the
 best use of a capable receiver while still working with a basic one, supply several
 **pre-rendered** versions and let the tool pick:
@@ -246,8 +259,9 @@ repeatable, mutually exclusive with `--send`, and each `<res>` is:
 
 Each `<file>` must be a **bilevel TIFF** of the matching width (rendered per the
 recipes below); the tool cross-checks the width and warns on an unexpected vertical
-resolution. Colour is not supported — the installed spandsp has no colour fax codecs,
-so all input must be bilevel.
+resolution. `--send-alt` carries only the bilevel renditions — colour and greyscale
+versions of the document are supplied separately via `--send-color`/`--send-gray`
+(see [Colour fax & file transfer](#colour-fax--file-transfer)).
 
 > The **receiving** side now advertises every bilevel resolution it can decode
 > (standard … 400 dpi); a stock spandsp DIS omits 300/400 dpi, so without this a
@@ -355,7 +369,7 @@ fax_test.sh --listen 5000                                   # serve a poll (TCP 
 ## Multi-page documents (PDF → TIFF)
 
 To send a multi-page document, convert it to a single **multi-page Group-4 TIFF**
-and `--send` that file directly — spandsp transmits one fax page per TIFF page.
+and `--send` that file directly — one fax page is transmitted per TIFF page.
 
 The cleanest tool is **Ghostscript's `tiffg4` device**, which renders straight to
 Group-4 and, because the output filename has no `%d`, writes every page into one
@@ -601,11 +615,19 @@ still reconstructs the exact codestream / file).
 - `make check-fax` / `check-ecm` / `check-color` — full-call suites (own engine
   loopback, interop with the spandsp fax engine both ways, ECM with injected
   frame loss, colour/file transfer).
-- `../xcheck.sh` — the two `sip_fax` builds against each other over TCP in all
-  four sender/receiver pairings.
-- `../sweep.sh [--quick]` — the acceptance gate: both builds across a line
+- `make check-t38` / `check-t38-interop` / `check-t38-gateway` — the T.38
+  suites (see [T.38](#t38-fax-over-ip)).
+- `make check-ctc` — the ECM CTC/CTR rate-fallback ladder, nf↔nf with
+  rate-gated frame loss.
+- `make check-v8` / `check-v34` / `check-v34fax` — V.8 handshake vs the spandsp
+  oracle; V.34 unit + real-capture decode tests; an end-to-end nf↔nf fax over
+  V.34 (T.30 Annex F), pixel-exact.
+- `make check-md5` — known-answer test for the digest-auth MD5.
+- `xcheck.sh` (in the companion `fax3` workspace) — this build against the
+  stock spandsp build over TCP in all four sender/receiver pairings.
+- `sweep.sh [--quick]` (ibid.) — the acceptance gate: both builds across a line
   impairment matrix (noise, frequency offset, tilt, group delay, THD, phase
-  jitter, clock slip, gain) via `../line_sim`, all four pairings. Rule:
+  jitter, clock slip, gain) via `line_sim`, all four pairings. Rule:
   wherever spandsp→spandsp completes, every pairing involving this build must
   complete at least as well.
 
@@ -618,7 +640,9 @@ tiff2pdf out.tiff -o out.pdf    # view all pages
 
 ## Notes / non-goals
 
-- One call/connection, one fax per run. No reconnect/retry logic.
+- One call/connection, one fax per run (`--daemon` is the exception). The only
+  retry logic is the V.34 fallback: a dialed call that negotiated V.34 but then
+  failed is redialed once as classic G3 (`--no-redial` opts out).
 - **Station identifier.** `--ident <str>` sets the local 20-char station id sent
   in T.30 phase B as TSI (transmitting), CSI (answering) or CIG (polling); the
   remote's id is logged at Phase E and stored in the received TIFF's
@@ -632,7 +656,8 @@ tiff2pdf out.tiff -o out.pdf    # view all pages
   and the lower-layer T.30/V.34/T.38 traces, prefixes every log line with a
   wall-clock timestamp (so SIP and T.30 events can be correlated), and collects
   the artifacts under an auto-named directory (or `--debug-dir`):
-  `session.log` (the full trace), `rx.pcm` (inbound decoded audio) and
+  `session.log` (the full trace), `rx.pcm` (inbound decoded audio), `tx.pcm`
+  (outbound audio) and
   `report.txt` (a post-mortem of the negotiated modem/rate/ECM and outcome).
   Replay the captured audio through the receiver offline with
   `--replay-rx <dir>/rx.pcm --receive out.tiff --verbose`.
@@ -658,10 +683,19 @@ tiff2pdf out.tiff -o out.pdf    # view all pages
 The SIP/RTP support is intentionally minimal — just enough to carry one fax:
 
 - **PCMA (G.711 A-law) at 8 kHz only** — the format the fax engine speaks, with
-  no resampling. T.38 is not used; this is audio (G.711 pass-through) fax.
-- Single call, no threads; UAC (dial) or UAS (answer) with an optional single
+  no resampling. Without `--t38` this is audio (G.711 pass-through) fax; `--t38`
+  adds the UDPTL/IFP switchover described in [T.38](#t38-fax-over-ip).
+- Single call per process, no threads (the daemon forks one child per call);
+  UAC (dial) or UAS (answer) with an optional single
   REGISTER. RTP media is paced against the wall clock at 20 ms.
 - Best-effort signalling: one 401/407 digest retry and simple fixed
   retransmits, not the full RFC 3261 transaction timer machinery.
-- IPv4 only. The fuller, threaded, multi-call/multi-codec implementation lives
-  in `../sip_modem/sip_interface`.
+- **IPv4 and IPv6.** All SIP, RTP and UDPTL sockets are dual-stack (an IPv6
+  socket accepting mapped IPv4, falling back to plain IPv4 on kernels without
+  IPv6), so either family works for signalling and media, chosen by what the
+  peer/registrar host resolves to. SDP is built and parsed with `c=IN IP4` /
+  `c=IN IP6`, and Via/Contact carry the local address `[bracketed]` when it is
+  IPv6. Write numeric IPv6 hosts in URIs bracketed too:
+  `--user 'sip:fax@[2001:db8::1]' --sip-dial 'sip:fax@[2001:db8::1]'`.
+- The fuller, threaded, multi-call/multi-codec implementation lives
+  in the separate `sip_modem` project's `sip_interface`.

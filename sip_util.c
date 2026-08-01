@@ -12,6 +12,9 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #if defined(__linux__)
 #include <sys/random.h>
 #endif
@@ -229,6 +232,120 @@ void parse_quoted(const char *hdrstr, const char *key, char *out, int outlen) {
     if (n >= outlen) n = outlen - 1;
     memcpy(out, p, (size_t)n);
     out[n] = '\0';
+}
+
+/* ── Family-agnostic socket addresses (IPv4 + IPv6) ───────────────── */
+
+socklen_t sa_len(const struct sockaddr_storage *ss) {
+    if (ss->ss_family == AF_INET6) return sizeof(struct sockaddr_in6);
+    return sizeof(struct sockaddr_in);
+}
+
+int sa_port(const struct sockaddr_storage *ss) {
+    if (ss->ss_family == AF_INET6)
+        return ntohs(((const struct sockaddr_in6 *)ss)->sin6_port);
+    if (ss->ss_family == AF_INET)
+        return ntohs(((const struct sockaddr_in *)ss)->sin_port);
+    return 0;
+}
+
+void sa_set_port(struct sockaddr_storage *ss, int port) {
+    if (ss->ss_family == AF_INET6)
+        ((struct sockaddr_in6 *)ss)->sin6_port = htons((uint16_t)port);
+    else if (ss->ss_family == AF_INET)
+        ((struct sockaddr_in *)ss)->sin_port = htons((uint16_t)port);
+}
+
+/* Canonical form for comparison/printing: a v4-mapped IPv6 address collapses
+ * to the plain IPv4 sockaddr it denotes; anything else is copied verbatim. */
+static void sa_unmap(const struct sockaddr_storage *ss, struct sockaddr_storage *out) {
+    if (ss->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)ss;
+        if (IN6_IS_ADDR_V4MAPPED(&s6->sin6_addr)) {
+            struct sockaddr_in v4;
+            memset(&v4, 0, sizeof(v4));
+            v4.sin_family = AF_INET;
+            v4.sin_port   = s6->sin6_port;
+            memcpy(&v4.sin_addr, &s6->sin6_addr.s6_addr[12], 4);
+            memset(out, 0, sizeof(*out));
+            memcpy(out, &v4, sizeof(v4));
+            return;
+        }
+    }
+    *out = *ss;
+}
+
+const char *sa_ntop(const struct sockaddr_storage *ss, char *buf, size_t len) {
+    struct sockaddr_storage c;
+    sa_unmap(ss, &c);
+    const void *a = NULL;
+    if (c.ss_family == AF_INET6)     a = &((struct sockaddr_in6 *)&c)->sin6_addr;
+    else if (c.ss_family == AF_INET) a = &((struct sockaddr_in *)&c)->sin_addr;
+    if (!a || !inet_ntop(c.ss_family, a, buf, (socklen_t)len))
+        buf[0] = '\0';
+    return buf;
+}
+
+int sa_same_addr(const struct sockaddr_storage *a, const struct sockaddr_storage *b) {
+    struct sockaddr_storage ca, cb;
+    sa_unmap(a, &ca);
+    sa_unmap(b, &cb);
+    if (ca.ss_family != cb.ss_family) return 0;
+    if (ca.ss_family == AF_INET6)
+        return memcmp(&((struct sockaddr_in6 *)&ca)->sin6_addr,
+                      &((struct sockaddr_in6 *)&cb)->sin6_addr, 16) == 0;
+    if (ca.ss_family == AF_INET)
+        return ((struct sockaddr_in *)&ca)->sin_addr.s_addr ==
+               ((struct sockaddr_in *)&cb)->sin_addr.s_addr;
+    return 0;
+}
+
+int sa_same_addr_port(const struct sockaddr_storage *a, const struct sockaddr_storage *b) {
+    return sa_same_addr(a, b) && sa_port(a) == sa_port(b);
+}
+
+int sa_from_ip(struct sockaddr_storage *ss, int sock_af, const char *ip, int port) {
+    memset(ss, 0, sizeof(*ss));
+    if (strchr(ip, ':')) {
+        struct sockaddr_in6 s6;
+        memset(&s6, 0, sizeof(s6));
+        s6.sin6_family = AF_INET6;
+        s6.sin6_port   = htons((uint16_t)port);
+        if (inet_pton(AF_INET6, ip, &s6.sin6_addr) != 1) return -1;
+        memcpy(ss, &s6, sizeof(s6));
+    } else {
+        struct sockaddr_in v4;
+        memset(&v4, 0, sizeof(v4));
+        v4.sin_family = AF_INET;
+        v4.sin_port   = htons((uint16_t)port);
+        if (inet_pton(AF_INET, ip, &v4.sin_addr) != 1) return -1;
+        memcpy(ss, &v4, sizeof(v4));
+    }
+    return sa_map_to_af(ss, sock_af);
+}
+
+int sa_map_to_af(struct sockaddr_storage *ss, int sock_af) {
+    if (sock_af == AF_INET6 && ss->ss_family == AF_INET) {
+        const struct sockaddr_in *v4 = (const struct sockaddr_in *)ss;
+        struct sockaddr_in6 s6;
+        memset(&s6, 0, sizeof(s6));
+        s6.sin6_family = AF_INET6;
+        s6.sin6_port   = v4->sin_port;
+        s6.sin6_addr.s6_addr[10] = 0xff;
+        s6.sin6_addr.s6_addr[11] = 0xff;
+        memcpy(&s6.sin6_addr.s6_addr[12], &v4->sin_addr, 4);
+        memset(ss, 0, sizeof(*ss));
+        memcpy(ss, &s6, sizeof(s6));
+        return 0;
+    }
+    if (sock_af == AF_INET && ss->ss_family == AF_INET6) {
+        struct sockaddr_storage c;
+        sa_unmap(ss, &c);
+        if (c.ss_family != AF_INET) return -1;   /* real IPv6, v4-only socket */
+        *ss = c;
+        return 0;
+    }
+    return 0;
 }
 
 /* ── Monotonic time (CLOCK_MONOTONIC) ─────────────────────────────── */
